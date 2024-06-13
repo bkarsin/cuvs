@@ -35,7 +35,7 @@ void generate_dataset(raft::device_resources const &dev_resources,
   auto labels = raft::make_device_vector<int64_t, int64_t>(dev_resources,
                                                            dataset.extent(0));
   raft::random::make_blobs(dev_resources, dataset, labels.view());
-  raft::random::RngState r(1234ULL);
+  raft::random::RngState r(time(NULL));
   raft::random::uniform(
       dev_resources, r,
       raft::make_device_vector_view(queries.data_handle(), queries.size()),
@@ -97,4 +97,98 @@ subsample(raft::device_resources const &dev_resources,
                           raft::make_const_mdspan(train_indices.view()));
 
   return trainset;
+}
+
+
+template<typename T, typename idxT>
+void read_labeled_data(std::string data_fname, 
+                       std::string data_label_fname, 
+                       std::string query_fname, 
+                       std::string query_label_fname, 
+                       std::vector<T>* data, 
+                       std::vector<std::vector<int>>* data_labels, 
+                       std::vector<T>* queries, 
+                       std::vector<std::vector<int>>* query_labels, 
+                       std::vector<int>* cat_freq, 
+                       std::vector<int>* query_freq, 
+                       int max_N) {
+
+  // Read datafile in
+  std::ifstream datafile(data_fname, std::ifstream::binary);
+  uint32_t N;
+  uint32_t dim;
+  datafile.read((char*)&N, sizeof(uint32_t));
+  datafile.read((char*)&dim, sizeof(uint32_t));
+
+  if(N > max_N) N = max_N;
+  printf("N:%u, dim:%u\n", N, dim);
+
+  data->resize(N*dim);
+  datafile.read(reinterpret_cast<char*>(data->data()), N*dim);
+  datafile.close();
+
+
+  // read query data in
+  std::ifstream queryfile(query_fname, std::ifstream::binary);
+  
+  uint32_t q_N;
+  uint32_t q_dim;
+  queryfile.read((char*)&q_N, sizeof(uint32_t));
+  queryfile.read((char*)&q_dim, sizeof(uint32_t));
+printf("qN:%u, qdim:%u\n", q_N, q_dim);
+  if(q_dim != dim) {
+    printf("query dim and data dim don't match!\n");
+    exit(1);
+  }
+  queries->resize(q_N*dim);
+  queryfile.read(reinterpret_cast<char*>(queries->data()), q_N*dim);
+  queryfile.close();
+
+  // read labels for data vectors
+  data_labels->reserve(N);
+  std::ifstream labelfile(data_label_fname);
+  std::string line, token;
+  std::string label_str;
+  int cnt=0;
+//  while(std::getline(labelfile, line)) {
+  while(cnt < N && std::getline(labelfile, line)) {
+    std::vector<int> label_list;
+    std::istringstream ss(line);
+    for(int i; ss >> i;) {
+      if(i > cat_freq->size()) { cat_freq->resize(i, 0); printf("new size:%d\n", cat_freq->size());}
+      (*cat_freq)[i]++;
+      label_list.push_back(i);
+      if(ss.peek() == ',')
+         ss.ignore();
+    }
+    data_labels->push_back(label_list); 
+
+    cnt++;
+  }
+  labelfile.close();
+
+  // read labels for queries
+  query_freq->resize(cat_freq->size(), 0);
+  query_labels->reserve(q_N);
+  std::ifstream qlabelfile(query_label_fname);
+  cnt=0;
+//  while(std::getline(labelfile, line)) {
+  while(cnt < q_N && std::getline(qlabelfile, line)) {
+    std::vector<int> label_list;
+    std::istringstream ss(line);
+    for(int i; ss >> i;) {
+//      if(i > query_freq->size()) { query_freq->resize(i, 0); }
+      (*query_freq)[i]++;
+      label_list.push_back(i);
+      if(ss.peek() == ',')
+         ss.ignore();
+    }
+    query_labels->push_back(label_list); 
+
+    cnt++;
+  }
+  qlabelfile.close();
+
+  printf("queries read. size:%d\n", queries->size());
+
 }

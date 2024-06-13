@@ -35,8 +35,14 @@ set(BUILD_CUVS_C_LIBRARY OFF)
 include(../cmake/thirdparty/get_cuvs.cmake)
 
 # -------------- compile tasks ----------------- #
-add_executable(CAGRA_EXAMPLE src/cagra_example.cu)
+#add_executable(CAGRA_EXAMPLE src/cagra_example.cu)
+#add_executable(CAGRA_SUBGRAPH src/cagra_filter_subgraph.cu)
+add_executable(CAGRA_INPUT src/cagra_subgraph_input.cu)
+add_executable(CAGRA_FILTER_SIMPLE src/cagra_filtered.cu)
 
 # `$<TARGET_NAME_IF_EXISTS:conda_env>` is a generator expression that ensures that targets are
 # installed in a conda environment, if one exists
-target_link_libraries(CAGRA_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+#target_link_libraries(CAGRA_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+#target_link_libraries(CAGRA_SUBGRAPH PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+target_link_libraries(CAGRA_INPUT PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+target_link_libraries(CAGRA_FILTER_SIMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)

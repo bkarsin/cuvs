@@ -723,6 +723,17 @@ void search(raft::resources const& res,
  * @}
  */
 
+//template <typename T, typename IdxT, typename CagraSampleFilterT>
+/*
+void search_with_filtering(raft::resources const& res,
+                           const search_params& params,
+                           const index<T, IdxT>& idx,
+                           raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
+                           raft::device_matrix_view<IdxT, int64_t, raft::row_major> neighbors,
+                           raft::device_matrix_view<float, int64_t, raft::row_major> distances,
+                           CagraSampleFilterT sample_filter = CagraSampleFilterT());
+*/
+
 /**
  * @defgroup cagra_cpp_serialize CAGRA serialize functions
  * @{
