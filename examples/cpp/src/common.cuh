@@ -34,8 +34,9 @@ void generate_dataset(raft::device_resources const &dev_resources,
                       raft::device_matrix_view<float, int64_t> queries) {
   auto labels = raft::make_device_vector<int64_t, int64_t>(dev_resources,
                                                            dataset.extent(0));
-  raft::random::make_blobs(dev_resources, dataset, labels.view());
   raft::random::RngState r(1234ULL);
+
+  raft::random::make_blobs(dev_resources, dataset, labels.view());
   raft::random::uniform(
       dev_resources, r,
       raft::make_device_vector_view(queries.data_handle(), queries.size()),
