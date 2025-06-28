@@ -33,7 +33,6 @@ void vamana_build_and_write(raft::device_resources const &dev_resources,
                             std::string out_fname, int degree, int visited_size,
                             float max_fraction, float iters,
                             std::string codebook_prefix) {
->>>>>>> james/jamxia_vamana_serialize_quantize_build
   using namespace cuvs::neighbors;
 
   // use default index parameters
@@ -103,7 +102,7 @@ int main(int argc, char *argv[]) {
   int degree = atoi(argv[4]);
   int max_visited = atoi(argv[5]);
   float max_fraction = atof(argv[6]);
-  int iters = atof(argv[7]);
+  float iters = atof(argv[7]);
   std::string codebook_prefix = "";
   if (argc >= 9)
     codebook_prefix = (std::string)argv[8]; // Path prefix to pq pivots and rotation matrix files
