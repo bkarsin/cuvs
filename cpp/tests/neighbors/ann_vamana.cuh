@@ -270,18 +270,16 @@ class AnnVamanaTest : public ::testing::TestWithParam<AnnVamanaInputs> {
       raft::random::normal(handle_, r, queries_f32.data(), ps.n_queries * ps.dim, 0.1f, 2.0f);
       raft::linalg::map(
         handle_,
-        raft::make_device_vector_view<half, int64_t>(database.data(),
-                                                     (int64_t)ps.n_rows * ps.dim),
+        raft::make_device_vector_view<half, int64_t>(database.data(), (int64_t)ps.n_rows * ps.dim),
         cast_to_half_op{},
         raft::make_device_vector_view<const float, int64_t>(database_f32.data(),
                                                             (int64_t)ps.n_rows * ps.dim));
-      raft::linalg::map(
-        handle_,
-        raft::make_device_vector_view<half, int64_t>(search_queries.data(),
-                                                     (int64_t)ps.n_queries * ps.dim),
-        cast_to_half_op{},
-        raft::make_device_vector_view<const float, int64_t>(queries_f32.data(),
-                                                            (int64_t)ps.n_queries * ps.dim));
+      raft::linalg::map(handle_,
+                        raft::make_device_vector_view<half, int64_t>(
+                          search_queries.data(), (int64_t)ps.n_queries * ps.dim),
+                        cast_to_half_op{},
+                        raft::make_device_vector_view<const float, int64_t>(
+                          queries_f32.data(), (int64_t)ps.n_queries * ps.dim));
     } else {
       raft::random::uniformInt(
         handle_, r, database.data(), ps.n_rows * ps.dim, DataT(1), DataT(20));

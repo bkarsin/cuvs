@@ -35,7 +35,7 @@ namespace cuvs::neighbors::vamana::detail {
 #define FULL_BITMASK 0xFFFFFFFF
 
 // Warp stride for per-warp distance reduction (GreedySearch uses multiple warps per block).
-//static constexpr int raft::WarpSize = raft::WarpSize;
+// static constexpr int raft::WarpSize = raft::WarpSize;
 
 // vamana fp16 instantiations use CUDA's half type (alias of __half on device).
 template <typename T>
@@ -178,8 +178,10 @@ __device__ SUMTYPE l2_ILP4(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* dst_ve
   for (int i = threadIdx.x; i < src_vec->Dim; i += 4 * blockDim.x) {
     temp_dst[0] = dst_vec->coords[i];
     if (i + raft::WarpSize < src_vec->Dim) temp_dst[1] = dst_vec->coords[i + raft::WarpSize];
-    if (i + (2*raft::WarpSize) < src_vec->Dim) temp_dst[2] = dst_vec->coords[i + (2*raft::WarpSize)];
-    if (i + (3*raft::WarpSize) < src_vec->Dim) temp_dst[3] = dst_vec->coords[i + (3*raft::WarpSize)];
+    if (i + (2 * raft::WarpSize) < src_vec->Dim)
+      temp_dst[2] = dst_vec->coords[i + (2 * raft::WarpSize)];
+    if (i + (3 * raft::WarpSize) < src_vec->Dim)
+      temp_dst[3] = dst_vec->coords[i + (3 * raft::WarpSize)];
 
     partial_sum[0] = fmaf(
       (src_vec[0].coords[i] - temp_dst[0]), (src_vec[0].coords[i] - temp_dst[0]), partial_sum[0]);
@@ -187,18 +189,18 @@ __device__ SUMTYPE l2_ILP4(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* dst_ve
       partial_sum[1] = fmaf((src_vec[0].coords[i + raft::WarpSize] - temp_dst[1]),
                             (src_vec[0].coords[i + raft::WarpSize] - temp_dst[1]),
                             partial_sum[1]);
-    if (i + 2*raft::WarpSize < src_vec->Dim)
-      partial_sum[2] = fmaf((src_vec[0].coords[i + 2*raft::WarpSize] - temp_dst[2]),
-                            (src_vec[0].coords[i + 2*raft::WarpSize] - temp_dst[2]),
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      partial_sum[2] = fmaf((src_vec[0].coords[i + 2 * raft::WarpSize] - temp_dst[2]),
+                            (src_vec[0].coords[i + 2 * raft::WarpSize] - temp_dst[2]),
                             partial_sum[2]);
-    if (i + 3*raft::WarpSize < src_vec->Dim)
-      partial_sum[3] = fmaf((src_vec[0].coords[i + 3*raft::WarpSize] - temp_dst[3]),
-                            (src_vec[0].coords[i + 3*raft::WarpSize] - temp_dst[3]),
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      partial_sum[3] = fmaf((src_vec[0].coords[i + 3 * raft::WarpSize] - temp_dst[3]),
+                            (src_vec[0].coords[i + 3 * raft::WarpSize] - temp_dst[3]),
                             partial_sum[3]);
   }
   partial_sum[0] += partial_sum[1] + partial_sum[2] + partial_sum[3];
 
-  for (int offset = raft::WarpSize/2; offset > 0; offset /= 2) {
+  for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
     partial_sum[0] += __shfl_down_sync(FULL_BITMASK, partial_sum[0], offset);
   }
 
@@ -280,16 +282,18 @@ __device__ SUMTYPE l2_ILP4_half(Point<__half, SUMTYPE>* src_vec, Point<__half, S
   for (int i = threadIdx.x; i < src_vec->Dim; i += 4 * blockDim.x) {
     temp_dst[0] = dst_vec->coords[i];
     if (i + raft::WarpSize < src_vec->Dim) temp_dst[1] = dst_vec->coords[i + raft::WarpSize];
-    if (i + 2*raft::WarpSize < src_vec->Dim) temp_dst[2] = dst_vec->coords[i + 2*raft::WarpSize];
-    if (i + 3*raft::WarpSize < src_vec->Dim) temp_dst[3] = dst_vec->coords[i + 3*raft::WarpSize];
-    
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      temp_dst[2] = dst_vec->coords[i + 2 * raft::WarpSize];
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      temp_dst[3] = dst_vec->coords[i + 3 * raft::WarpSize];
+
     l2_half_fma_sq(partial_sum[0], src_vec[0].coords[i], temp_dst[0]);
     if (i + raft::WarpSize < src_vec->Dim)
       l2_half_fma_sq(partial_sum[1], src_vec[0].coords[i + raft::WarpSize], temp_dst[1]);
-    if (i + 2*raft::WarpSize < src_vec->Dim)
-      l2_half_fma_sq(partial_sum[2], src_vec[0].coords[i + 2*raft::WarpSize], temp_dst[2]);
-    if (i + 3*raft::WarpSize < src_vec->Dim)
-      l2_half_fma_sq(partial_sum[3], src_vec[0].coords[i + 3*raft::WarpSize], temp_dst[3]);
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      l2_half_fma_sq(partial_sum[2], src_vec[0].coords[i + 2 * raft::WarpSize], temp_dst[2]);
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      l2_half_fma_sq(partial_sum[3], src_vec[0].coords[i + 3 * raft::WarpSize], temp_dst[3]);
   }
   partial_sum[0] =
     __hadd(partial_sum[0], __hadd(partial_sum[1], __hadd(partial_sum[2], partial_sum[3])));
@@ -334,7 +338,6 @@ __host__ __device__ SUMTYPE l2(const T* src, const T* dest, int dim)
   return l2<T, SUMTYPE>(&src_p, &dest_p);
 }
 
-
 template <typename T, typename SUMTYPE>
 __host__ __device__ SUMTYPE
 dist(const T* src, const T* dest, int dim, cuvs::distance::DistanceType metric)
@@ -345,7 +348,6 @@ dist(const T* src, const T* dest, int dim, cuvs::distance::DistanceType metric)
   }
   return d;
 }
-
 
 /*
  * Warp-strided L2 / dist: each warp computes one distance using lanes 0..31 only.
@@ -370,7 +372,6 @@ __device__ SUMTYPE l2_SEQ_warp(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* ds
 template <typename T, typename SUMTYPE>
 __device__ SUMTYPE l2_ILP2_warp(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* dst_vec, int lane)
 {
-	
   T temp_dst[2]          = {0, 0};
   SUMTYPE partial_sum[2] = {0, 0};
   for (int i = lane; i < src_vec->Dim; i += 2 * raft::WarpSize) {
@@ -399,8 +400,10 @@ __device__ SUMTYPE l2_ILP4_warp(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* d
   for (int i = lane; i < src_vec->Dim; i += 4 * raft::WarpSize) {
     temp_dst[0] = dst_vec->coords[i];
     if (i + raft::WarpSize < src_vec->Dim) temp_dst[1] = dst_vec->coords[i + raft::WarpSize];
-    if (i + 2*raft::WarpSize < src_vec->Dim) temp_dst[2] = dst_vec->coords[i + 2*raft::WarpSize];
-    if (i + 3*raft::WarpSize < src_vec->Dim) temp_dst[3] = dst_vec->coords[i + 3*raft::WarpSize];
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      temp_dst[2] = dst_vec->coords[i + 2 * raft::WarpSize];
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      temp_dst[3] = dst_vec->coords[i + 3 * raft::WarpSize];
 
     partial_sum[0] = fmaf(
       (src_vec[0].coords[i] - temp_dst[0]), (src_vec[0].coords[i] - temp_dst[0]), partial_sum[0]);
@@ -408,13 +411,13 @@ __device__ SUMTYPE l2_ILP4_warp(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* d
       partial_sum[1] = fmaf((src_vec[0].coords[i + raft::WarpSize] - temp_dst[1]),
                             (src_vec[0].coords[i + raft::WarpSize] - temp_dst[1]),
                             partial_sum[1]);
-    if (i + 2*raft::WarpSize < src_vec->Dim)
-      partial_sum[2] = fmaf((src_vec[0].coords[i + 2*raft::WarpSize] - temp_dst[2]),
-                            (src_vec[0].coords[i + 2*raft::WarpSize] - temp_dst[2]),
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      partial_sum[2] = fmaf((src_vec[0].coords[i + 2 * raft::WarpSize] - temp_dst[2]),
+                            (src_vec[0].coords[i + 2 * raft::WarpSize] - temp_dst[2]),
                             partial_sum[2]);
-    if (i + 3*raft::WarpSize < src_vec->Dim)
-      partial_sum[3] = fmaf((src_vec[0].coords[i + 3*raft::WarpSize] - temp_dst[3]),
-                            (src_vec[0].coords[i + 3*raft::WarpSize] - temp_dst[3]),
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      partial_sum[3] = fmaf((src_vec[0].coords[i + 3 * raft::WarpSize] - temp_dst[3]),
+                            (src_vec[0].coords[i + 3 * raft::WarpSize] - temp_dst[3]),
                             partial_sum[3]);
   }
   partial_sum[0] += partial_sum[1] + partial_sum[2] + partial_sum[3];
@@ -467,16 +470,18 @@ __device__ SUMTYPE l2_ILP4_half_warp(Point<__half, SUMTYPE>* src_vec,
   for (int i = lane; i < src_vec->Dim; i += 4 * raft::WarpSize) {
     temp_dst[0] = dst_vec->coords[i];
     if (i + raft::WarpSize < src_vec->Dim) temp_dst[1] = dst_vec->coords[i + raft::WarpSize];
-    if (i + 2*raft::WarpSize < src_vec->Dim) temp_dst[2] = dst_vec->coords[i + 2*raft::WarpSize];
-    if (i + 3*raft::WarpSize < src_vec->Dim) temp_dst[3] = dst_vec->coords[i + 3*raft::WarpSize];
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      temp_dst[2] = dst_vec->coords[i + 2 * raft::WarpSize];
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      temp_dst[3] = dst_vec->coords[i + 3 * raft::WarpSize];
 
     l2_half_fma_sq(partial_sum[0], src_vec[0].coords[i], temp_dst[0]);
     if (i + raft::WarpSize < src_vec->Dim)
       l2_half_fma_sq(partial_sum[1], src_vec[0].coords[i + raft::WarpSize], temp_dst[1]);
-    if (i + 2*raft::WarpSize < src_vec->Dim)
-      l2_half_fma_sq(partial_sum[2], src_vec[0].coords[i + 2*raft::WarpSize], temp_dst[2]);
-    if (i + 3*raft::WarpSize < src_vec->Dim)
-      l2_half_fma_sq(partial_sum[3], src_vec[0].coords[i + 3*raft::WarpSize], temp_dst[3]);
+    if (i + 2 * raft::WarpSize < src_vec->Dim)
+      l2_half_fma_sq(partial_sum[2], src_vec[0].coords[i + 2 * raft::WarpSize], temp_dst[2]);
+    if (i + 3 * raft::WarpSize < src_vec->Dim)
+      l2_half_fma_sq(partial_sum[3], src_vec[0].coords[i + 3 * raft::WarpSize], temp_dst[3]);
   }
   partial_sum[0] =
     __hadd(partial_sum[0], __hadd(partial_sum[1], __hadd(partial_sum[2], partial_sum[3])));
@@ -591,12 +596,12 @@ __device__ SUMTYPE l2_ILP2_warp_float_half(const float* src, const __half* dst, 
   for (int i = lane * 2; i < dim; i += 2 * raft::WarpSize * 2) {
     float2 temp_dst[2] = {{0, 0}, {0, 0}};
     temp_dst[0]        = l2_load_dst2_half(dst, i);
-    if (i + 2*raft::WarpSize < dim) temp_dst[1] = l2_load_dst2_half(dst, i + 2*raft::WarpSize);
+    if (i + 2 * raft::WarpSize < dim) temp_dst[1] = l2_load_dst2_half(dst, i + 2 * raft::WarpSize);
 
     float2 src0 = l2_load_src2(src, i);
     l2_fma_sq2(partial_sum[0], src0.x, src0.y, temp_dst[0]);
-    if (i + 2*raft::WarpSize < dim) {
-      float2 src1 = l2_load_src2(src, i + 2*raft::WarpSize);
+    if (i + 2 * raft::WarpSize < dim) {
+      float2 src1 = l2_load_src2(src, i + 2 * raft::WarpSize);
       l2_fma_sq2(partial_sum[1], src1.x, src1.y, temp_dst[1]);
     }
   }
@@ -1089,7 +1094,7 @@ __device__ void update_shared_point_warp_half_to_float(
     }
     return;
   }
-  for (size_t i = laneId * 2; i + 1 < (size_t)dim; i += 2*raft::WarpSize) {
+  for (size_t i = laneId * 2; i + 1 < (size_t)dim; i += 2 * raft::WarpSize) {
     float2 promoted    = __half22float2(*reinterpret_cast<const half2*>(&half_ptr[base + i]));
     float2* coord_pair = reinterpret_cast<float2*>(&shared_point->coords[i]);
     *coord_pair        = promoted;
@@ -1113,7 +1118,7 @@ __device__ void update_shared_point_warp_fp16_query_smem(
     }
     return;
   }
-  for (size_t i = laneId * 2; i + 1 < (size_t)dim; i += 2*raft::WarpSize) {
+  for (size_t i = laneId * 2; i + 1 < (size_t)dim; i += 2 * raft::WarpSize) {
     float2 v = *reinterpret_cast<const float2*>(&data_ptr[base + i]);
     *reinterpret_cast<half2*>(&shared_point->coords[i]) = __float22half2_rn(v);
   }

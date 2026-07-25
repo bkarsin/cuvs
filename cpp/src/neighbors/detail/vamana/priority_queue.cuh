@@ -275,7 +275,7 @@ __inline__ __device__ void parallel_pq_max_enqueue_warp(Node<SUMTYPE>* pq,
       }
     }
 
-    if (laneId == 31) {
+    if (laneId == raft::WarpSize - 1) {
       *max_idx     = idx;
       *cur_max_val = max_val;
     }

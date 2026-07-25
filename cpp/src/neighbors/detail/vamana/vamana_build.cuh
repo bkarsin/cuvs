@@ -475,11 +475,10 @@ void batched_insert_vamana(
       cuvs::sparse::neighbors::get_n_components(edge_dest.data_handle(), total_edges, stream);
 
     // Find which node IDs have reverse edges and their indices in the reverse edge list
-    RAFT_CUDA_TRY(cudaMemcpyAsync(thrust::raw_pointer_cast(edge_dest_vec.data()),
-                                  edge_dest.data_handle(),
-                                  total_edges * sizeof(IdxT),
-                                  cudaMemcpyDeviceToDevice,
-                                  stream));
+    raft::copy(thrust::raw_pointer_cast(edge_dest_vec.data()),
+               edge_dest.data_handle(),
+               total_edges * sizeof(IdxT),
+               stream);
     auto unique_indices = raft::make_device_vector<int>(res, total_edges);
     raft::linalg::map_offset(res, unique_indices.view(), raft::identity_op{});
 

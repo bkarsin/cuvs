@@ -32,7 +32,8 @@ namespace cuvs::neighbors::vamana::detail {
 template <typename accT, typename IdxT, int CANDS>
 __forceinline__ __device__ void sort_visited(
   QueryCandidates<IdxT, accT>* query,
-  typename cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, (CANDS / raft::WarpSize)>::TempStorage* sort_mem)
+  typename cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, (CANDS / raft::WarpSize)>::
+    TempStorage* sort_mem)
 {
   const int ELTS   = CANDS / raft::WarpSize;
   using BlockSortT = cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, ELTS>;
