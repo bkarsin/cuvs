@@ -477,7 +477,7 @@ void batched_insert_vamana(
     // Find which node IDs have reverse edges and their indices in the reverse edge list
     raft::copy(thrust::raw_pointer_cast(edge_dest_vec.data()),
                edge_dest.data_handle(),
-               total_edges * sizeof(IdxT),
+               total_edges,
                stream);
     auto unique_indices = raft::make_device_vector<int>(res, total_edges);
     raft::linalg::map_offset(res, unique_indices.view(), raft::identity_op{});
