@@ -211,7 +211,7 @@ __host__ __device__ bool operator>(const Node<SUMTYPE>& first, const Node<SUMTYP
   return first.distance > other.distance;
 }
 
-// each warp scans its own pq with laneId and stride 32 to find duplicates
+// each warp scans its own pq with laneId and stride 32(raft::WarpSize) to find duplicates
 template <typename accT>
 __device__ bool check_duplicate_warp(const Node<accT>* pq,
                                      const int size,
@@ -219,7 +219,7 @@ __device__ bool check_duplicate_warp(const Node<accT>* pq,
                                      int laneId)
 {
   bool found = false;
-  for (int i = laneId; i < size; i += 32) {
+  for (int i = laneId; i < size; i += raft::WarpSize) {
     if (pq[i].nodeid == new_node.nodeid) {
       found = true;
       break;
@@ -259,7 +259,7 @@ __inline__ __device__ void parallel_pq_max_enqueue_warp(Node<SUMTYPE>* pq,
     int idx         = 0;
     SUMTYPE max_val = pq[0].distance;
 
-    for (int i = laneId; i < pq_size; i += 32) {
+    for (int i = laneId; i < pq_size; i += raft::WarpSize) {
       if (pq[i].distance > max_val) {
         max_val = pq[i].distance;
         idx     = i;
@@ -323,17 +323,20 @@ __forceinline__ __device__ void enqueue_all_neighbors_warp(
   cuvs::distance::DistanceType metric,
   int laneId)
 {
-  if (fp16_query_smem) {
-    Point<__half, accT> query_vec;
-    query_vec.coords = s_coords_half;
-    query_vec.Dim    = dim;
-    enqueue_all_neighbors_warp<__half, T, accT, IdxT>(
-      num_neighbors, &query_vec, vec_ptr, neighbor_array, heap_queue, dim, metric, laneId);
-  } else if constexpr (is_cuda_fp16_v<T>) {
+  // fp16-query-in-smem never applies to a half dataset (see greedy_search_use_fp16_query_smem),
+  // so the half-query branch is compile-time excluded for half T to avoid instantiating the dead
+  // half-query-vs-half-neighbor distance path.
+  if constexpr (is_cuda_fp16_v<T>) {
     Point<float, accT> query_vec;
     query_vec.coords = reinterpret_cast<float*>(s_coords);
     query_vec.Dim    = dim;
     enqueue_all_neighbors_warp<float, T, accT, IdxT>(
+      num_neighbors, &query_vec, vec_ptr, neighbor_array, heap_queue, dim, metric, laneId);
+  } else if (fp16_query_smem) {
+    Point<__half, accT> query_vec;
+    query_vec.coords = s_coords_half;
+    query_vec.Dim    = dim;
+    enqueue_all_neighbors_warp<__half, T, accT, IdxT>(
       num_neighbors, &query_vec, vec_ptr, neighbor_array, heap_queue, dim, metric, laneId);
   } else {
     Point<T, accT> query_vec;

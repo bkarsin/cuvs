@@ -32,10 +32,10 @@ namespace cuvs::neighbors::vamana::detail {
 template <typename accT, typename IdxT, int CANDS>
 __forceinline__ __device__ void sort_visited(
   QueryCandidates<IdxT, accT>* query,
-  typename cub::BlockMergeSort<DistPair<IdxT, accT>, 32, (CANDS / 32)>::TempStorage* sort_mem)
+  typename cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, (CANDS / raft::WarpSize)>::TempStorage* sort_mem)
 {
-  const int ELTS   = CANDS / 32;
-  using BlockSortT = cub::BlockMergeSort<DistPair<IdxT, accT>, 32, ELTS>;
+  const int ELTS   = CANDS / raft::WarpSize;
+  using BlockSortT = cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, ELTS>;
   DistPair<IdxT, accT> tmp[ELTS];
   for (int i = 0; i < ELTS; i++) {
     tmp[i].idx  = query->ids[ELTS * threadIdx.x + i];
@@ -59,7 +59,7 @@ template <typename T, typename accT, typename IdxT = uint32_t>
 __global__ void SortPairsKernel(void* query_list_ptr, int num_queries, int topk)
 {
   union ShmemLayout {
-    typename cub::BlockMergeSort<DistPair<IdxT, accT>, 32, 1>::TempStorage sort_mem;
+    typename cub::BlockMergeSort<DistPair<IdxT, accT>, raft::WarpSize, 1>::TempStorage sort_mem;
   };
   extern __shared__ __align__(alignof(ShmemLayout)) char smem[];
 
@@ -110,8 +110,8 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
   int max_queue_size,
   Node<accT>* topk_pq_mem)
 {
-  const int warpIdx = threadIdx.x / 32;
-  const int laneId  = threadIdx.x % 32;
+  const int warpIdx = threadIdx.x / raft::WarpSize;
+  const int laneId  = threadIdx.x % raft::WarpSize;
 
   int dim    = dataset.extent(1);
   int degree = graph.extent(1);
@@ -171,19 +171,18 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
     query_list[i].reset_warp(laneId);
 
     int cur_query_id = query_list[i].queryId;
-    if (fp16_query_smem) {
-      if constexpr (is_cuda_fp16_v<T>) {
-        update_shared_point_warp_fp16_query_smem<accT>(
-          &s_query_half, vec_ptr, cur_query_id, dim, laneId);
-      } else if constexpr (std::is_same_v<T, float>) {
+    // fp16-query-in-smem never applies to a half dataset (see greedy_search_use_fp16_query_smem),
+    // so the half branch is compile-time excluded to avoid instantiating the dead half-query path.
+    if constexpr (is_cuda_fp16_v<T>) {
+      update_shared_point_warp_half_to_float<accT>(&s_query, vec_ptr, cur_query_id, dim, laneId);
+    } else if (fp16_query_smem) {
+      if constexpr (std::is_same_v<T, float>) {
         update_shared_point_warp_fp16_query_smem<accT>(
           &s_query_half, vec_ptr, cur_query_id, dim, laneId);
       } else {
         update_shared_point_warp_fp16_query_smem<T, accT>(
           &s_query_half, vec_ptr, cur_query_id, dim, laneId);
       }
-    } else if constexpr (is_cuda_fp16_v<T>) {
-      update_shared_point_warp_half_to_float<accT>(&s_query, vec_ptr, cur_query_id, dim, laneId);
     } else {
       update_shared_point_warp<T, accT>(&s_query, vec_ptr, cur_query_id, dim, laneId);
     }
@@ -202,12 +201,12 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
     }
 
     accT medoid_dist;
-    if (fp16_query_smem) {
-      medoid_dist = dist_warp_half_query<accT, T>(
-        s_coords_half, &vec_ptr[(size_t)medoid_id * (size_t)dim], dim, metric, laneId);
-    } else if constexpr (is_cuda_fp16_v<T>) {
+    if constexpr (is_cuda_fp16_v<T>) {
       medoid_dist =
         dist_warp<accT>(s_coords, &vec_ptr[(size_t)medoid_id * (size_t)dim], dim, metric, laneId);
+    } else if (fp16_query_smem) {
+      medoid_dist = dist_warp_half_query<accT, T>(
+        s_coords_half, &vec_ptr[(size_t)medoid_id * (size_t)dim], dim, metric, laneId);
     } else {
       medoid_dist = dist_warp<T, accT>(
         s_coords, &vec_ptr[(size_t)medoid_id * (size_t)dim], dim, metric, laneId);
@@ -265,7 +264,7 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
 
       num_neighbors[warpIdx] = degree;
 
-      for (size_t j = laneId; j < degree; j += 32) {
+      for (size_t j = laneId; j < degree; j += raft::WarpSize) {
         neighbor_array[j] = graph(cand_num, j);
         if (neighbor_array[j] == raft::upper_bound<IdxT>())
           atomicMin(&num_neighbors[warpIdx],
@@ -285,7 +284,7 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
     }
 
     bool self_found = false;
-    for (int j = laneId; j < query_list[i].size; j += 32) {
+    for (int j = laneId; j < query_list[i].size; j += raft::WarpSize) {
       if (query_list[i].ids[j] == cur_query_id) {
         query_list[i].dists[j] = raft::upper_bound<accT>();
         query_list[i].ids[j]   = raft::upper_bound<IdxT>();
@@ -294,7 +293,7 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
     }
     self_found = (raft::ballot(self_found) != 0);
 
-    for (int j = query_list[i].size + laneId; j < query_list[i].maxSize; j += 32) {
+    for (int j = query_list[i].size + laneId; j < query_list[i].maxSize; j += raft::WarpSize) {
       query_list[i].ids[j]   = raft::upper_bound<IdxT>();
       query_list[i].dists[j] = raft::upper_bound<accT>();
     }
