@@ -53,13 +53,13 @@ struct greedy_search_query_coord {
 static constexpr int kGreedySearchFp16QuerySmemMinDim = 512;
 
 template <typename T>
-__host__ __device__ inline bool greedy_search_use_fp16_query_smem(int dim)
+RAFT_HOST_DEVICE_INLINE bool greedy_search_use_fp16_query_smem(int dim)
 {
   return dim >= kGreedySearchFp16QuerySmemMinDim && !is_cuda_fp16_v<T>;
 }
 
 template <typename T>
-__host__ __device__ inline int greedy_search_query_smem_elem_size(int dim)
+RAFT_HOST_DEVICE_INLINE int greedy_search_query_smem_elem_size(int dim)
 {
   if (greedy_search_use_fp16_query_smem<T>(dim)) { return static_cast<int>(sizeof(__half)); }
   return static_cast<int>(sizeof(typename greedy_search_query_coord<T>::type));

@@ -92,16 +92,6 @@ __global__ void print_queryIds(void* query_list_ptr)
 #define KERNEL_TIMING (RAFT_LOG_ACTIVE_LEVEL <= RAPIDS_LOGGER_LOG_LEVEL_DEBUG)
 
 template <typename accT, typename IdxT>
-__global__ void gather_query_sizes(QueryCandidates<IdxT, accT>* query_list,
-                                   int* edge_counts,
-                                   int count)
-{
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += blockDim.x * gridDim.x) {
-    edge_counts[i] = query_list[i].size;
-  }
-}
-
-template <typename accT, typename IdxT>
 __global__ void scatter_prefix_offsets(QueryCandidates<IdxT, accT>* query_list,
                                        const int* edge_offsets,
                                        int count)
@@ -415,8 +405,10 @@ void batched_insert_vamana(
 
     // compute prefix sums of query_list sizes
     const int prefix_count = step_size + 1;
-    gather_query_sizes<accT, IdxT>
-      <<<num_blocks, blockD, 0, stream>>>(query_list, edge_counts.data_handle(), prefix_count);
+    raft::linalg::map_offset(
+      res,
+      raft::make_device_vector_view<int, int64_t>(edge_counts.data_handle(), prefix_count),
+      [query_list] __device__(int64_t i) { return query_list[i].size; });
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     cub::DeviceScan::ExclusiveSum(scan_temp_storage.data_handle(),
@@ -475,10 +467,8 @@ void batched_insert_vamana(
       cuvs::sparse::neighbors::get_n_components(edge_dest.data_handle(), total_edges, stream);
 
     // Find which node IDs have reverse edges and their indices in the reverse edge list
-    raft::copy(thrust::raw_pointer_cast(edge_dest_vec.data()),
-               edge_dest.data_handle(),
-               total_edges,
-               stream);
+    raft::copy(
+      thrust::raw_pointer_cast(edge_dest_vec.data()), edge_dest.data_handle(), total_edges, stream);
     auto unique_indices = raft::make_device_vector<int>(res, total_edges);
     raft::linalg::map_offset(res, unique_indices.view(), raft::identity_op{});
 
