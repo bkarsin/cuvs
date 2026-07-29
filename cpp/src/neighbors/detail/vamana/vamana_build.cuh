@@ -20,6 +20,7 @@
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/logger.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/device_properties.hpp>
 #include <raft/linalg/gemm.cuh>
 #include <raft/matrix/copy.cuh>
 #include <raft/matrix/init.cuh>
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
@@ -330,18 +332,33 @@ void batched_insert_vamana(
     set_query_ids<IdxT, accT><<<num_blocks, blockD, 0, stream>>>(
       query_list_ptr.data_handle(), query_ids.data_handle(), step_size);
 
-    // Call greedy search to get candidates for every vector being inserted
-    GreedySearchKernel<T, accT, IdxT, Accessor>
-      <<<num_blocks_greedy, blockD_greedy, search_smem_total_size, stream>>>(
-        d_graph.view(),
-        dataset,
-        query_list_ptr.data_handle(),
-        step_size,
-        *medoid_id,
-        visited_size,
-        metric,
-        queue_size,
-        topk_pq_mem.data_handle());
+    // Call greedy search to get candidates for every vector being inserted.
+    // __launch_bounds__ requires a compile-time min-blocks-per-SM, so pick it on the host from the
+    // running device's threads/SM cap and dispatch to the matching kernel instantiation. This keeps
+    // the requested occupancy hint within the hardware limit (e.g. SM 7.2/7.5 cap at 1024/SM, where
+    // 12 * 128 = 1536 would overflow ptxas's ".minnctapersm").
+    int const greedy_max_blocks_per_sm =
+      raft::resource::get_device_properties(res).maxThreadsPerMultiProcessor / blockD_greedy;
+
+    auto launch_greedy = [&](auto min_blocks_c) {
+      GreedySearchKernel<T, accT, IdxT, Accessor, decltype(min_blocks_c)::value>
+        <<<num_blocks_greedy, blockD_greedy, search_smem_total_size, stream>>>(
+          d_graph.view(),
+          dataset,
+          query_list_ptr.data_handle(),
+          step_size,
+          *medoid_id,
+          visited_size,
+          metric,
+          queue_size,
+          topk_pq_mem.data_handle());
+    };
+
+    if (greedy_max_blocks_per_sm >= 12) {
+      launch_greedy(std::integral_constant<int, 12>{});
+    } else {
+      launch_greedy(std::integral_constant<int, 8>{});
+    }
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
 #if KERNEL_TIMING
