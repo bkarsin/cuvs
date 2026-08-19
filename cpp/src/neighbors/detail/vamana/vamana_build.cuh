@@ -25,12 +25,14 @@
 #include <raft/matrix/copy.cuh>
 #include <raft/matrix/init.cuh>
 
-#include <thrust/device_vector.h>
+#include <thrust/device_ptr.h>
 #include <thrust/sequence.h>
 #include <thrust/unique.h>
 
 #include <cub/device/device_merge_sort.cuh>
 #include <cub/device/device_scan.cuh>
+
+#include <rmm/exec_policy.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -293,7 +295,8 @@ void batched_insert_vamana(
   auto scan_temp_storage = raft::make_device_mdarray<uint8_t>(
     res, large_ws, raft::make_extents<int64_t>(std::max(scan_temp_bytes, size_t{1})));
 
-  thrust::device_vector<IdxT> edge_dest_vec(max_total_edges);
+  auto edge_dest_vec =
+    raft::make_device_mdarray<IdxT>(res, large_ws, raft::make_extents<int64_t>(max_total_edges));
 
   auto reverse_list_ptr = raft::make_device_mdarray<QueryCandidates<IdxT, accT>>(
     res, large_ws, raft::make_extents<int64_t>(max_reverse_batch));
@@ -484,13 +487,14 @@ void batched_insert_vamana(
       cuvs::sparse::neighbors::get_n_components(edge_dest.data_handle(), total_edges, stream);
 
     // Find which node IDs have reverse edges and their indices in the reverse edge list
-    raft::copy(
-      thrust::raw_pointer_cast(edge_dest_vec.data()), edge_dest.data_handle(), total_edges, stream);
+    raft::copy(edge_dest_vec.data_handle(), edge_dest.data_handle(), total_edges, stream);
     auto unique_indices = raft::make_device_vector<int>(res, total_edges);
     raft::linalg::map_offset(res, unique_indices.view(), raft::identity_op{});
 
-    thrust::unique_by_key(
-      edge_dest_vec.begin(), edge_dest_vec.begin() + total_edges, unique_indices.data_handle());
+    thrust::unique_by_key(rmm::exec_policy_nosync(stream, large_ws),
+                          thrust::device_pointer_cast(edge_dest_vec.data_handle()),
+                          thrust::device_pointer_cast(edge_dest_vec.data_handle() + total_edges),
+                          thrust::device_pointer_cast(unique_indices.data_handle()));
 
 #if KERNEL_TIMING
     RAFT_CUDA_TRY(cudaDeviceSynchronize());
