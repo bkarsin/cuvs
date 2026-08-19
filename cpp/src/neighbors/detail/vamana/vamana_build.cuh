@@ -306,7 +306,7 @@ void batched_insert_vamana(
 
   // Random medoid has minor impact on recall
   // TODO: use heuristic for better medoid selection, issue:
-  // https://github.com/rapidsai/cuvs/issues/355
+  // https://github.com/nvidia/cuvs/issues/355
   *medoid_id = rand() % N;
 
   // size of current batch of inserts, increases logarithmically until max_batchsize
@@ -685,7 +685,7 @@ index<T, IdxT> build(
 
     auto quantizer = cuvs::preprocessing::quantize::pq::quantizer<float>(
       pq_params,
-      cuvs::neighbors::vpq_dataset<float, int64_t>{
+      cuvs::neighbors::device_vpq_dataset<float, int64_t>{
         raft::make_device_matrix<float, uint32_t, raft::row_major>(res, 0, 0),
         std::move(pq_codebook),
         raft::make_device_matrix<uint8_t, int64_t, raft::row_major>(res, 0, 0)});
