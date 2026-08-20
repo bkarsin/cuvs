@@ -86,19 +86,26 @@ __global__ void SortPairsKernel(void* query_list_ptr, int num_queries, int topk)
            during the GreedySearch.
 **********************************************************************************************/
 // GreedySearchKernel launches 128 threads/block and requests a minimum blocks-per-SM hint for
-// occupancy. __launch_bounds__ must be a compile-time constant, so MinBlocksPerSM is a template
-// parameter selected on the host from the running device's properties (see the launch site).
-// Rationale: on SMs that cap at 1024 threads/SM (e.g. SM 7.2 Xavier / SM 7.5 Turing) 12 * 128 =
-// 1536 exceeds the limit and ptxas emits ".minnctapersm out of range ... will be ignored". The
-// host derives the value from maxThreadsPerMultiProcessor / blockThreads and passes 8 there while
-// keeping the tuned value of 12 on larger SMs.
+// occupancy. __launch_bounds__ must be a compile-time constant, and nvcc compiles this kernel
+// once per entry in CMAKE_CUDA_ARCHITECTURES (independent of which GPU eventually runs the code),
+// so the value must be selected per-architecture at compile time via __CUDA_ARCH__ -- a host-side
+// runtime check (e.g. raft::resource::get_device_properties) cannot help, since every requested
+// architecture still needs to compile successfully regardless of which branch would run at
+// runtime. On SMs that cap at 1024 threads/SM (SM 7.2 Xavier / SM 7.5 Turing), 12 * 128 = 1536
+// exceeds the limit and ptxas hard-errors ("value of threads per SM ... is out of range"). Use 8
+// (8 * 128 = 1024) on those architectures and keep the tuned value of 12 elsewhere (>=1536
+// threads/SM on every other currently supported architecture).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 720 || __CUDA_ARCH__ == 750)
+#define VAMANA_GREEDY_MIN_BLOCKS_PER_SM 8
+#else
+#define VAMANA_GREEDY_MIN_BLOCKS_PER_SM 12
+#endif
 template <typename T,
           typename accT,
           typename IdxT = uint32_t,
           typename Accessor =
-            raft::host_device_accessor<cuda::std::default_accessor<T>, raft::memory_type::host>,
-          int MinBlocksPerSM = 12>
-__global__ __launch_bounds__(128, MinBlocksPerSM) void GreedySearchKernel(
+            raft::host_device_accessor<cuda::std::default_accessor<T>, raft::memory_type::host>>
+__global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySearchKernel(
   raft::device_matrix_view<IdxT, int64_t> graph,
   raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, Accessor> dataset,
   void* query_list_ptr,
@@ -302,6 +309,7 @@ __global__ __launch_bounds__(128, MinBlocksPerSM) void GreedySearchKernel(
 
   return;
 }
+#undef VAMANA_GREEDY_MIN_BLOCKS_PER_SM
 
 }  // namespace
 
