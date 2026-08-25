@@ -276,6 +276,7 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
           atomicMin(&num_neighbors[warpIdx],
                     (int)j);  // warp-wide min to find the number of neighbors
       }
+      __syncwarp();
 
       enqueue_all_neighbors_warp(num_neighbors[warpIdx],
                                  fp16_query_smem,
@@ -294,7 +295,7 @@ __global__ __launch_bounds__(128, VAMANA_GREEDY_MIN_BLOCKS_PER_SM) void GreedySe
       if (query_list[i].ids[j] == cur_query_id) {
         query_list[i].dists[j] = raft::upper_bound<accT>();
         query_list[i].ids[j]   = raft::upper_bound<IdxT>();
-        self_found             = true;  // Flat to reduce size by 1
+        self_found             = true;  // Flag to reduce size by 1
       }
     }
     self_found = (raft::ballot(self_found) != 0);

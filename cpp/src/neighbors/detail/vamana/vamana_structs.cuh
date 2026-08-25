@@ -207,13 +207,6 @@ __device__ SUMTYPE l2_ILP4(Point<T, SUMTYPE>* src_vec, Point<T, SUMTYPE>* dst_ve
   return partial_sum[0];
 }
 
-/* fp16: native __hsub/__hfma throughout; single float widen at return */
-__device__ __forceinline__ void l2_half_accum(__half& lane_sum, __half s, __half t)
-{
-  __half d = __hsub(s, t);
-  lane_sum = __hfma(d, d, lane_sum);
-}
-
 /* ILP helpers: accumulate (s-t)^2 into acc; operands must already be loaded */
 __device__ __forceinline__ void l2_half_fma_sq(__half& acc, __half s, __half t)
 {
@@ -248,7 +241,7 @@ __device__ SUMTYPE l2_SEQ_half(Point<__half, SUMTYPE>* src_vec, Point<__half, SU
   __half lane_sum = __float2half(0.0f);
 
   for (int i = threadIdx.x; i < src_vec->Dim; i += blockDim.x) {
-    l2_half_accum(lane_sum, src_vec[0].coords[i], dst_vec[0].coords[i]);
+    l2_half_fma_sq(lane_sum, src_vec[0].coords[i], dst_vec[0].coords[i]);
   }
 
   return l2_half_warp_reduce<SUMTYPE>(lane_sum);
@@ -434,7 +427,7 @@ __device__ SUMTYPE l2_SEQ_half_warp(Point<__half, SUMTYPE>* src_vec,
 {
   __half lane_sum = __float2half(0.0f);
   for (int i = lane; i < src_vec->Dim; i += raft::WarpSize) {
-    l2_half_accum(lane_sum, src_vec[0].coords[i], dst_vec[0].coords[i]);
+    l2_half_fma_sq(lane_sum, src_vec[0].coords[i], dst_vec[0].coords[i]);
   }
   return l2_half_warp_reduce<SUMTYPE>(lane_sum);
 }
@@ -1167,7 +1160,6 @@ __global__ void create_reverse_edge_list(void* query_list_ptr,
 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_queries;
        i += blockDim.x * gridDim.x) {
-    int read_idx   = i * query_list[i].maxSize;
     int cand_count = query_list[i + 1].size - query_list[i].size;
 
     for (int j = 0; j < cand_count; j++) {
