@@ -247,6 +247,11 @@ __device__ SUMTYPE l2_SEQ_half(Point<__half, SUMTYPE>* src_vec, Point<__half, SU
   return l2_half_warp_reduce<SUMTYPE>(lane_sum);
 }
 
+/*
+ * Can use the half2 type to load pairs of values and the __hfma2 and __hsub2 operators to
+ * calculate. Issue #2510 created in cuVS to track this optimizaiton.
+ */
+
 template <typename SUMTYPE>
 __device__ SUMTYPE l2_ILP2_half(Point<__half, SUMTYPE>* src_vec, Point<__half, SUMTYPE>* dst_vec)
 {
@@ -529,6 +534,10 @@ __device__ __forceinline__ float2 l2_load_dst2_half(const __half* dst, int i)
   return __half22float2(*reinterpret_cast<const half2*>(&dst[i]));
 }
 
+/*
+ * Can use the __fmaf2 and __fsub2 operators to directly calculate on float2
+ * Issue #2510 created in cuVS to track this optimization.
+ */
 template <typename SUMTYPE>
 __device__ __forceinline__ void l2_fma_sq2(SUMTYPE& acc, float sx, float sy, float2 dst2)
 {
