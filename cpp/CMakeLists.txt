@@ -1443,6 +1443,7 @@ if(NOT BUILD_CPU_ONLY)
     src/neighbors/sample_filter.cu
     src/neighbors/tiered_index.cu
     src/neighbors/sparse_brute_force.cu
+    src/neighbors/gpipnn_build.cu
     src/neighbors/vamana_build_float.cu
     src/neighbors/vamana_build_uint8.cu
     src/neighbors/vamana_build_int8.cu
