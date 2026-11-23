@@ -29,8 +29,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <exception>
+#include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <semaphore>
 #include <type_traits>
 #include <utility>
@@ -63,100 +67,185 @@ inline auto leaf_batch_max_members(const index_params& params, int64_t n_rows, i
   return std::max<int64_t>(1, budget / per_member);
 }
 
-class gpipnn_host_manager {
-  friend class carve_hash_main_manager;
+class buffer_slot {
+public:
+  buffer_slot(const buffer_slot&) = delete;
+  auto operator=(const buffer_slot&) -> buffer_slot& = delete;
+  auto operator=(buffer_slot&&) noexcept -> buffer_slot& = delete;
+
+  virtual ~buffer_slot() = default;
+
+  [[nodiscard]] virtual auto data() noexcept -> void* = 0;
+  [[nodiscard]] virtual auto size() const noexcept -> std::size_t = 0;
+
+protected:
+  buffer_slot() = default;
+  buffer_slot(buffer_slot&&) noexcept = default;
+};
+
+// A buffer slot or call to get_slot outliving the cpu buffer is undefined behavior
+class cpu_buffer {
+  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
+  {
+    RAFT_EXPECTS(num_slots > 0, "cpu_buffer requires at least one slot");
+    RAFT_EXPECTS(num_slots <= std::counting_semaphore<>::max(),
+                  "cpu_buffer slot count exceeds the semaphore maximum");
+    return num_slots;
+  }
+
+public:
+  class cpu_buffer_slot final : public buffer_slot {
+    friend class cpu_buffer;
+
+  public:
+    cpu_buffer_slot(const cpu_buffer_slot&) = delete;
+    auto operator=(const cpu_buffer_slot&) -> cpu_buffer_slot& = delete;
+
+    cpu_buffer_slot(cpu_buffer_slot&& other) noexcept
+      : cpu_buffer_(other.cpu_buffer_),
+        data_(std::move(other.data_)),
+        leased_(std::exchange(other.leased_, false))
+    {
+    }
+    auto operator=(cpu_buffer_slot&&) -> cpu_buffer_slot& = delete;
+
+    ~cpu_buffer_slot() override
+    {
+      if (!leased_) { return; }
+      leased_ = false;
+      {
+        std::lock_guard<std::mutex> lock(cpu_buffer_->buffer_mtx_);
+        cpu_buffer_->available_slots_.push_back(std::move(*this));
+      }
+      cpu_buffer_->num_available_slots_.release();
+    }
+
+    [[nodiscard]] auto data() noexcept -> void* override
+    {
+      return data_.data();
+    }
+
+    [[nodiscard]] auto size() const noexcept -> std::size_t override
+    {
+      return data_.size();
+    }
+
+  private:
+    explicit cpu_buffer_slot(cpu_buffer* buffer, std::size_t buffer_size)
+      : cpu_buffer_(buffer), data_(buffer_size)
+    {
+    }
+
+    cpu_buffer* const cpu_buffer_;
+    std::vector<uint8_t> data_;
+    bool leased_{false};
+  };
+
+  explicit cpu_buffer(const std::ptrdiff_t num_slots, const std::size_t buffer_size)
+    : num_available_slots_{validate_num_slots(num_slots)}
+  {
+    available_slots_.reserve(static_cast<std::size_t>(num_slots));
+    for (std::ptrdiff_t slot = 0; slot < num_slots; ++slot) {
+      available_slots_.push_back(cpu_buffer_slot{this, buffer_size});
+    }
+  }
+
+  [[nodiscard]] auto get_slot() -> cpu_buffer_slot
+  {
+    num_available_slots_.acquire();
+    std::lock_guard<std::mutex> lock(buffer_mtx_);
+    auto slot = std::move(available_slots_.back());
+    available_slots_.pop_back();
+    slot.leased_ = true;
+    return slot;
+  }
 
 private:
-  // A buffer slot or call to get_slot outliving the cpu buffer is undefined behavior
-  class cpu_buffer {
-    static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
-    {
-      RAFT_EXPECTS(num_slots > 0, "cpu_buffer requires at least one slot");
-      RAFT_EXPECTS(num_slots <= std::counting_semaphore<>::max(),
-                   "cpu_buffer slot count exceeds the semaphore maximum");
-      return num_slots;
+  std::vector<cpu_buffer_slot> available_slots_;
+  std::counting_semaphore<> num_available_slots_; // threads wait till a slot is available
+  std::mutex buffer_mtx_; // mutex to assign distinct slots to requesting threads
+
+};
+
+class cpu_job {
+public:
+  enum class ExitStatus { kSuccess, kFailure, kKill };
+
+  virtual ~cpu_job() = default;
+  [[nodiscard]] auto execute() noexcept -> ExitStatus
+  {
+    try {
+      return execute_impl();
+    } catch (const std::exception& error) {
+      std::cerr << "CPU job failed: " << error.what() << std::endl;
+    } catch (...) {
+      std::cerr << "CPU job failed with an unknown exception" << std::endl;
     }
+    return ExitStatus::kFailure;
+  }
 
-  public:
-    class cpu_buffer_slot {
-      friend class cpu_buffer;
+protected:
+  cpu_job() = default;
+  [[nodiscard]] virtual auto execute_impl() -> ExitStatus = 0;
+};
 
-      public:
-      cpu_buffer_slot(const cpu_buffer_slot&) = delete;
-      auto operator=(const cpu_buffer_slot&) -> cpu_buffer_slot& = delete;
+// cuda_event must remain valid until job execution completes
+class hash_prune_merge_job : public cpu_job {
+public:
+  hash_prune_merge_job(cudaEvent_t cuda_event, cpu_buffer::cpu_buffer_slot buffer_slot)
+    : cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
+  {
+  }
 
-      cpu_buffer_slot(cpu_buffer_slot&& other) noexcept
-        : cpu_buffer_(other.cpu_buffer_),
-          data_(std::move(other.data_)),
-          leased_(std::exchange(other.leased_, false))
-      {
-      }
-      auto operator=(cpu_buffer_slot&&) -> cpu_buffer_slot& = delete;
+  [[nodiscard]] auto execute_impl() -> ExitStatus override
+  {
+    RAFT_CUDA_TRY(cudaEventSynchronize(cuda_event_));
+    std::cout << "hash_prune_merge" << std::endl;
+    return ExitStatus::kSuccess;
+  }
 
-      ~cpu_buffer_slot()
-      {
-        if (!leased_) { return; }
-        leased_ = false;
-        {
-          std::lock_guard<std::mutex> lock(cpu_buffer_->buffer_mtx_);
-          cpu_buffer_->available_slots_.push_back(std::move(*this));
-        }
-        cpu_buffer_->num_available_slots_.release();
-      }
+private:
+  cudaEvent_t cuda_event_;
+  cpu_buffer::cpu_buffer_slot buffer_slot_;
+};
 
-      [[nodiscard]] auto data() noexcept -> unsigned char*
-      {
-        return data_.data();
-      }
+class kill_job : public cpu_job {
+public:
+  [[nodiscard]] auto execute_impl() -> ExitStatus override { return ExitStatus::kKill; }
+};
 
-      [[nodiscard]] auto size() const noexcept -> std::size_t
-      {
-        return data_.size();
-      }
+// must push one kill job per worker to kill all workers
+// queue must outlive all workers
+class cpu_work_queue {
+public:
+  [[nodiscard]] auto pop_job() -> std::unique_ptr<cpu_job>
+  {
+    work_queue_size_.acquire();
+    std::lock_guard<std::mutex> lock(work_queue_mtx_);
+    auto job = std::move(work_queue_.front());
+    work_queue_.pop();
+    return job;
+  }
 
-      private:
-      explicit cpu_buffer_slot(cpu_buffer* buffer, std::size_t buffer_size)
-        : cpu_buffer_(buffer), data_(buffer_size)
-      {
-      }
+  void push_job(std::unique_ptr<cpu_job> job)
+  {
+    assert(job != nullptr);
+    std::lock_guard<std::mutex> lock(work_queue_mtx_);
+    work_queue_.push(std::move(job));
+    work_queue_size_.release();
+  }
 
-      cpu_buffer* const cpu_buffer_;
-      std::vector<uint8_t> data_;
-      bool leased_{false};
-    };
+private:
+  std::queue<std::unique_ptr<cpu_job>> work_queue_;
+  std::counting_semaphore<> work_queue_size_{0};
+  std::mutex work_queue_mtx_;
+};
 
-    explicit cpu_buffer(const std::ptrdiff_t num_slots, const std::size_t buffer_size)
-      : num_available_slots_{validate_num_slots(num_slots)}
-    {
-      available_slots_.reserve(static_cast<std::size_t>(num_slots));
-      for (std::ptrdiff_t slot = 0; slot < num_slots; ++slot) {
-        available_slots_.push_back(cpu_buffer_slot{this, buffer_size});
-      }
-    }
+class gpipnn_host_manager {
+  template <typename DataT>
+  friend class gpipnn_main_manager;
 
-    [[nodiscard]] auto get_slot() -> cpu_buffer_slot
-    {
-      num_available_slots_.acquire();
-      std::lock_guard<std::mutex> lock(buffer_mtx_);
-      auto slot = std::move(available_slots_.back());
-      available_slots_.pop_back();
-      slot.leased_ = true;
-      return slot;
-    }
-
-  private:
-    std::vector<cpu_buffer_slot> available_slots_; // vector of available buffer slots to give up
-    std::counting_semaphore<> num_available_slots_; // threads wait till a slot is available
-    std::mutex buffer_mtx_; // mutex to assign distinct slots to requesting threads
-    
-  };
-
-  class cpu_work_queue {
-  public:
-
-  private:
-    std::counting_semaphore<> work_queue_size_{0};
-  };
+private:
 
 
 public:
@@ -167,13 +256,80 @@ public:
 
 };
 
-class gpipnn_dev_manager {
-  friend class carve_hash_main_manager;
+// device memory buffer for single GPU worker (max pipelined cuda streams is effectively number of slots)
+class gpu_buffer {
+  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
+  {
+    RAFT_EXPECTS(num_slots > 0, "gpu_buffer requires at least one slot");
+    return num_slots;
+  }
+
+public:
+  class gpu_buffer_slot final : public buffer_slot {
+    friend class gpu_buffer;
+
+  public:
+    gpu_buffer_slot(const gpu_buffer_slot&) = delete;
+    auto operator=(const gpu_buffer_slot&) -> gpu_buffer_slot& = delete;
+    gpu_buffer_slot(gpu_buffer_slot&&) noexcept = default;
+    auto operator=(gpu_buffer_slot&&) noexcept -> gpu_buffer_slot& = delete;
+
+    [[nodiscard]] auto data() noexcept -> void* override { return data_.data(); }
+    [[nodiscard]] auto size() const noexcept -> std::size_t override { return data_.size(); }
+    [[nodiscard]] auto event() const noexcept -> cudaEvent_t { return event_; }
+
+  private:
+    gpu_buffer_slot(std::size_t buffer_size, cuda::stream_ref stream)
+      : data_{buffer_size, stream}
+    {
+    }
+
+    rmm::device_buffer data_;
+    cudaEvent_t event_{nullptr};
+  };
+
+  gpu_buffer(const std::ptrdiff_t num_slots,
+             const std::size_t buffer_size,
+             cuda::stream_ref stream)
+  {
+    const auto validated_num_slots = validate_num_slots(num_slots);
+    slots_.reserve(static_cast<std::size_t>(validated_num_slots));
+    for (std::ptrdiff_t slot = 0; slot < validated_num_slots; ++slot) {
+      slots_.push_back(gpu_buffer_slot{buffer_size, stream});
+    }
+  }
+
+  // TODO(sdickman): check if necessary synchronization step
+  ~gpu_buffer()
+  {
+    for (const auto& slot : slots_) {
+      if (slot.event_ != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaEventSynchronize(slot.event_)); }
+    }
+  }
+
+  // event represents the point at which the slot can be released
+  [[nodiscard]] auto get_slot(cudaEvent_t event) -> gpu_buffer_slot&
+  {
+    RAFT_EXPECTS(event != nullptr, "event dependency must not be nullptr");
+
+    auto& slot = slots_[next_slot_];
+    if (slot.event_ != nullptr) { RAFT_CUDA_TRY(cudaEventSynchronize(slot.event_)); }
+    slot.event_ = event;
+    next_slot_ = (next_slot_ + 1) % slots_.size();
+    return slot;
+  }
 
 private:
-  struct gpu_buffer {
-    std::vector<rmm::device_buffer> slots; // list<device buffer>
-  };
+  std::vector<gpu_buffer_slot> slots_;
+  std::size_t next_slot_{0};
+};
+
+
+class gpipnn_dev_manager {
+  template <typename DataT>
+  friend class gpipnn_main_manager;
+
+private:
 
 public:
   explicit gpipnn_dev_manager(raft::resources const& res) {
@@ -184,8 +340,8 @@ public:
 
 template <typename DataT>
 class gpipnn_main_manager {
-  friend class carve_hash_host_manager;
-  friend class carve_hash_dev_manager;
+  friend class gpipnn_host_manager;
+  friend class gpipnn_dev_manager;
   
 public:
   void build(raft::resources const& res,
