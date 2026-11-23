@@ -24,10 +24,17 @@
 #include <raft/util/cudart_utils.hpp>
 #include <raft/util/kernel_launch.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <mutex>
+#include <optional>
+#include <semaphore>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace cuvs::neighbors::experimental::gpipnn::detail {
 
@@ -55,6 +62,140 @@ inline auto leaf_batch_max_members(const index_params& params, int64_t n_rows, i
     leaf_degree * 2 * static_cast<int64_t>(sizeof(uint64_t) + sizeof(id_t)) * 2;
   return std::max<int64_t>(1, budget / per_member);
 }
+
+class gpipnn_host_manager {
+  friend class carve_hash_main_manager;
+
+private:
+  // A buffer slot or call to get_slot outliving the cpu buffer is undefined behavior
+  class cpu_buffer {
+    static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
+    {
+      RAFT_EXPECTS(num_slots > 0, "cpu_buffer requires at least one slot");
+      RAFT_EXPECTS(num_slots <= std::counting_semaphore<>::max(),
+                   "cpu_buffer slot count exceeds the semaphore maximum");
+      return num_slots;
+    }
+
+  public:
+    class cpu_buffer_slot {
+      friend class cpu_buffer;
+
+      public:
+      cpu_buffer_slot(const cpu_buffer_slot&) = delete;
+      auto operator=(const cpu_buffer_slot&) -> cpu_buffer_slot& = delete;
+
+      cpu_buffer_slot(cpu_buffer_slot&& other) noexcept
+        : cpu_buffer_(other.cpu_buffer_),
+          data_(std::move(other.data_)),
+          leased_(std::exchange(other.leased_, false))
+      {
+      }
+      auto operator=(cpu_buffer_slot&&) -> cpu_buffer_slot& = delete;
+
+      ~cpu_buffer_slot()
+      {
+        if (!leased_) { return; }
+        leased_ = false;
+        {
+          std::lock_guard<std::mutex> lock(cpu_buffer_->buffer_mtx_);
+          cpu_buffer_->available_slots_.push_back(std::move(*this));
+        }
+        cpu_buffer_->num_available_slots_.release();
+      }
+
+      [[nodiscard]] auto data() noexcept -> unsigned char*
+      {
+        return data_.data();
+      }
+
+      [[nodiscard]] auto size() const noexcept -> std::size_t
+      {
+        return data_.size();
+      }
+
+      private:
+      explicit cpu_buffer_slot(cpu_buffer* buffer, std::size_t buffer_size)
+        : cpu_buffer_(buffer), data_(buffer_size)
+      {
+      }
+
+      cpu_buffer* const cpu_buffer_;
+      std::vector<uint8_t> data_;
+      bool leased_{false};
+    };
+
+    explicit cpu_buffer(const std::ptrdiff_t num_slots, const std::size_t buffer_size)
+      : num_available_slots_{validate_num_slots(num_slots)}
+    {
+      available_slots_.reserve(static_cast<std::size_t>(num_slots));
+      for (std::ptrdiff_t slot = 0; slot < num_slots; ++slot) {
+        available_slots_.push_back(cpu_buffer_slot{this, buffer_size});
+      }
+    }
+
+    [[nodiscard]] auto get_slot() -> cpu_buffer_slot
+    {
+      num_available_slots_.acquire();
+      std::lock_guard<std::mutex> lock(buffer_mtx_);
+      auto slot = std::move(available_slots_.back());
+      available_slots_.pop_back();
+      slot.leased_ = true;
+      return slot;
+    }
+
+  private:
+    std::vector<cpu_buffer_slot> available_slots_; // vector of available buffer slots to give up
+    std::counting_semaphore<> num_available_slots_; // threads wait till a slot is available
+    std::mutex buffer_mtx_; // mutex to assign distinct slots to requesting threads
+    
+  };
+
+  class cpu_work_queue {
+  public:
+
+  private:
+    std::counting_semaphore<> work_queue_size_{0};
+  };
+
+
+public:
+  // Constructs empty hash buckets for hash pruning
+  explicit gpipnn_host_manager(...) {
+    
+  }
+
+};
+
+class gpipnn_dev_manager {
+  friend class carve_hash_main_manager;
+
+private:
+  struct gpu_buffer {
+    std::vector<rmm::device_buffer> slots; // list<device buffer>
+  };
+
+public:
+  explicit gpipnn_dev_manager(raft::resources const& res) {
+
+  }
+
+};
+
+template <typename DataT>
+class gpipnn_main_manager {
+  friend class carve_hash_host_manager;
+  friend class carve_hash_dev_manager;
+  
+public:
+  void build(raft::resources const& res,
+    const index_params& params,
+    raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
+    raft::device_matrix_view<id_t, int64_t, raft::row_major> graph) {
+    
+  }
+
+};
 
 /**
  * Builds a GPiPNN proximity graph.
