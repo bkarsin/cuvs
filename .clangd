@@ -1,0 +1,12 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -isystem
+    - /scratch/micromamba/envs/cuvs/include
+    - -include
+    - /home/sdickman/cuvs/.clangd_cuda_compat.hpp
+    - -nocudainc
+    - -nocudalib
+    - -D__CUDACC__
+  Remove:
+    - --compress-mode=*
