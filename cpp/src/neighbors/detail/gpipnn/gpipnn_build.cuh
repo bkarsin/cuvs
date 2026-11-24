@@ -34,12 +34,12 @@
 #include <pthread.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <semaphore>
 #include <type_traits>
@@ -261,12 +261,12 @@ public:
   auto operator=(gpu_job&&) -> gpu_job& = delete;
 
   virtual ~gpu_job() { synchronizer_.record_end(); }
-  void execute(cuda::stream_ref h2d_copy_stream,
-               cuda::stream_ref compute_stream,
+  void execute(raft::resources const& compute_res,
+               cuda::stream_ref h2d_copy_stream,
                cuda::stream_ref d2h_copy_stream) noexcept
   {
     try {
-      execute_impl(h2d_copy_stream, compute_stream, d2h_copy_stream);
+      execute_impl(compute_res, h2d_copy_stream, d2h_copy_stream);
     } catch (const std::exception& error) {
       std::cerr << "GPU job failed: " << error.what() << std::endl;
       std::terminate();
@@ -283,8 +283,8 @@ protected:
     synchronizer_.record_start();
   }
 
-  virtual void execute_impl(cuda::stream_ref h2d_copy_stream,
-                            cuda::stream_ref compute_stream,
+  virtual void execute_impl(raft::resources const& compute_res,
+                            cuda::stream_ref h2d_copy_stream,
                             cuda::stream_ref d2h_copy_stream) = 0;
 
 private:
@@ -585,11 +585,9 @@ private:
       try {
         RAFT_CUDA_TRY(cudaSetDevice(raft::resource::get_device_id(res)));
         RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&h2d_stream_handle_, cudaStreamNonBlocking));
-        RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&compute_stream_handle_, cudaStreamNonBlocking));
         RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&d2h_stream_handle_, cudaStreamNonBlocking));
-        h2d_stream_     = cuda::stream_ref{h2d_stream_handle_};
-        compute_stream_ = cuda::stream_ref{compute_stream_handle_};
-        d2h_stream_     = cuda::stream_ref{d2h_stream_handle_};
+        h2d_stream_ = cuda::stream_ref{h2d_stream_handle_};
+        d2h_stream_ = cuda::stream_ref{d2h_stream_handle_};
       } catch (...) {
         destroy_streams();
         throw;
@@ -611,7 +609,7 @@ private:
           log_message("GPU worker exiting after queue close");
           return;
         }
-        job->execute(h2d_stream_, compute_stream_, d2h_stream_);
+        job->execute(context.res, h2d_stream_, d2h_stream_);
       }
     }
 
@@ -622,24 +620,17 @@ private:
         RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(d2h_stream_handle_));
         d2h_stream_handle_ = nullptr;
       }
-      if (compute_stream_handle_ != nullptr) {
-        RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(compute_stream_handle_));
-        compute_stream_handle_ = nullptr;
-      }
       if (h2d_stream_handle_ != nullptr) {
         RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(h2d_stream_handle_));
         h2d_stream_handle_ = nullptr;
       }
-      h2d_stream_     = cuda::stream_ref{cudaStream_t{nullptr}};
-      compute_stream_ = cuda::stream_ref{cudaStream_t{nullptr}};
-      d2h_stream_     = cuda::stream_ref{cudaStream_t{nullptr}};
+      h2d_stream_ = cuda::stream_ref{cudaStream_t{nullptr}};
+      d2h_stream_ = cuda::stream_ref{cudaStream_t{nullptr}};
     }
 
     cudaStream_t h2d_stream_handle_{nullptr};
-    cudaStream_t compute_stream_handle_{nullptr};
     cudaStream_t d2h_stream_handle_{nullptr};
     cuda::stream_ref h2d_stream_{cudaStream_t{nullptr}};
-    cuda::stream_ref compute_stream_{cudaStream_t{nullptr}};
     cuda::stream_ref d2h_stream_{cudaStream_t{nullptr}};
   };
 
@@ -735,8 +726,8 @@ public:
   }
 
 private:
-  void execute_impl(cuda::stream_ref h2d_copy_stream,
-                    cuda::stream_ref compute_stream,
+  void execute_impl(raft::resources const& compute_res,
+                    cuda::stream_ref h2d_copy_stream,
                     cuda::stream_ref d2h_copy_stream) override
   {
     log_message("Executing test GPU job ",
@@ -765,6 +756,215 @@ private:
 };
 
 template <typename DataT>
+void gpipnn_setup(raft::resources const& compute_res,
+                  const index_params& params,
+                  raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
+                  raft::device_matrix_view<id_t, int64_t, raft::row_major> graph,
+                  rmm::device_uvector<half>& half_storage,
+                  rmm::device_uvector<float>& norms,
+                  const half*& scoring_data,
+                  cuda::stream_ref d2h_copy_stream)
+{
+  static_assert(std::is_same_v<DataT, float> || std::is_same_v<DataT, half> ||
+                  std::is_same_v<DataT, int8_t> || std::is_same_v<DataT, uint8_t>,
+                "gpipnn: only float, half, int8 and uint8 datasets are supported");
+
+  const auto arch_problem = gpipnn_arch_problem();
+  RAFT_EXPECTS(arch_problem.empty(), "%s", arch_problem.c_str());
+
+  const int64_t n_rows = dataset.extent(0);
+  const int64_t dim    = dataset.extent(1);
+  check_params(params, n_rows, dim, graph);
+
+  auto compute_stream  = raft::resource::get_cuda_stream(compute_res).get();
+  const bool normalize = params.metric == cuvs::distance::DistanceType::CosineExpanded;
+  scoring_data         = nullptr;
+  if constexpr (std::is_same_v<DataT, half>) {
+    if (!normalize) { scoring_data = dataset.data_handle(); }
+  }
+  if (scoring_data == nullptr) {
+    half_storage.resize(n_rows * dim, compute_stream);
+    rmm::device_uvector<int> overflowed(0, compute_stream);
+    if (normalize) {
+      raft::launch_kernel(compute_res,
+                          n_rows,
+                          256,
+                          normalize_rows_to_half_kernel<DataT, 256>,
+                          dataset.data_handle(),
+                          half_storage.data(),
+                          n_rows,
+                          dim);
+    } else {
+      float scale = 1.0f;
+      if constexpr (std::is_same_v<DataT, float>) {
+        float max_abs = params.dataset_max_abs;
+        if (max_abs > 0.0f) {
+          overflowed.resize(1, compute_stream);
+          raft::matrix::fill(
+            compute_res, raft::make_device_vector_view<int, int64_t>(overflowed.data(), 1), 0);
+        } else {
+          max_abs = finite_max_abs(compute_res, dataset.data_handle(), n_rows * dim);
+        }
+        scale = half_cast_scale(max_abs);
+        if (scale != 1.0f) {
+          RAFT_LOG_DEBUG(
+            "gpipnn: dataset magnitudes peak at %g, outside the range half holds usefully; "
+            "scaling by %g before conversion, which leaves the neighbour ordering unchanged",
+            static_cast<double>(max_abs),
+            static_cast<double>(scale));
+        }
+      }
+      cast_to_half(compute_res,
+                   dataset.data_handle(),
+                   half_storage.data(),
+                   n_rows * dim,
+                   scale,
+                   overflowed.is_empty() ? nullptr : overflowed.data());
+    }
+    if (!overflowed.is_empty() && !raft::resource::get_dry_run_flag(compute_res)) {
+      cuda_event overflow_ready;
+      RAFT_CUDA_TRY(cudaEventRecord(overflow_ready.value(), compute_stream));
+      RAFT_CUDA_TRY(
+        cudaStreamWaitEvent(d2h_copy_stream.get(), overflow_ready.value(), cudaEventWaitDefault));
+      int flag = 0;
+      raft::update_host(&flag, overflowed.data(), 1, d2h_copy_stream.get());
+      RAFT_CUDA_TRY(cudaStreamSynchronize(d2h_copy_stream.get()));
+      RAFT_EXPECTS(flag == 0,
+                   "gpipnn: dataset_max_abs (%g) is below the dataset's actual peak, so the "
+                   "conversion to half overflowed; every distance touching those elements would "
+                   "be NaN. Raise it, or leave it at 0 to have the build measure it",
+                   static_cast<double>(params.dataset_max_abs));
+    }
+    scoring_data = half_storage.data();
+  }
+
+  norms.resize(n_rows, compute_stream);
+  row_norms(scoring_data, n_rows, dim, norms.data(), compute_stream);
+  raft::resource::sync_stream(compute_res);
+}
+
+template <typename DataT>
+class gpipnn_setup_gpu_job final : public gpu_job {
+public:
+  gpipnn_setup_gpu_job(
+    compute_job_synchronizer& synchronizer,
+    const index_params& params,
+    raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
+    raft::device_matrix_view<id_t, int64_t, raft::row_major> graph,
+    rmm::device_uvector<half>& half_storage,
+    rmm::device_uvector<float>& norms,
+    const half*& scoring_data)
+    : gpu_job{synchronizer},
+      params_{params},
+      dataset_{dataset},
+      graph_{graph},
+      half_storage_{half_storage},
+      norms_{norms},
+      scoring_data_{scoring_data}
+  {
+  }
+
+private:
+  void execute_impl(raft::resources const& compute_res,
+                    cuda::stream_ref,
+                    cuda::stream_ref d2h_copy_stream) override
+  {
+    gpipnn_setup(compute_res,
+                 params_,
+                 dataset_,
+                 graph_,
+                 half_storage_,
+                 norms_,
+                 scoring_data_,
+                 d2h_copy_stream);
+  }
+
+  const index_params& params_;
+  raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset_;
+  raft::device_matrix_view<id_t, int64_t, raft::row_major> graph_;
+  rmm::device_uvector<half>& half_storage_;
+  rmm::device_uvector<float>& norms_;
+  const half*& scoring_data_;
+};
+
+template <typename ScoringViewT, typename NormsViewT>
+void gpipnn_build_remainder(raft::resources const& res,
+                            const index_params& params,
+                            ScoringViewT scoring_view,
+                            NormsViewT norms_view,
+                            raft::device_matrix_view<id_t, int64_t, raft::row_major> graph,
+                            std::chrono::steady_clock::time_point build_start)
+{
+  auto stream          = raft::resource::get_cuda_stream(res).get();
+  const int64_t n_rows = scoring_view.extent(0);
+
+  carve_stats stats;
+  auto leaves = ball_carve(res, scoring_view, norms_view, params, stats);
+  RAFT_LOG_DEBUG(
+    "gpipnn: %ld leaves over %ld memberships after %ld rounds (%ld chopped, %ld merged, %ld "
+    "still oversized)",
+    leaves.count(),
+    leaves.total(),
+    stats.rounds_run,
+    stats.chopped_runs,
+    stats.merged_runs,
+    stats.oversized_left);
+
+  const auto leaf_degree = static_cast<int64_t>(params.leaf_degree);
+  const auto hash_bits   = static_cast<int32_t>(params.hash_bits);
+
+  auto sketches = compute_sketches(res, scoring_view, hash_bits, params.seed + 7);
+  auto sketches_view =
+    raft::make_device_vector_view<const float, int64_t>(sketches.data(), n_rows * hash_bits);
+  auto acc = make_accumulator(res, n_rows, params.max_candidates);
+  rmm::device_uvector<int64_t> row_begin(n_rows + 1, stream);
+
+  const int64_t max_members = leaf_batch_max_members(params, n_rows, leaf_degree);
+
+  int64_t n_batches = 0;
+  int64_t n_records = 0;
+  for (int64_t lo = 0; lo < leaves.count();) {
+    int64_t hi      = lo;
+    int64_t members = 0;
+    while (hi < leaves.count() && (hi == lo || members + leaves.size_of(hi) <= max_members)) {
+      members += leaves.size_of(hi);
+      hi++;
+    }
+    auto records = leaf_pick_range(res, scoring_view, norms_view, leaves, leaf_degree, lo, hi);
+    n_records += records.n_valid;
+    hash_prune_merge(res, sketches_view, records, params, row_begin, acc);
+    lo = hi;
+    n_batches++;
+  }
+  RAFT_LOG_DEBUG("gpipnn: %ld candidate edge records over %ld leaf batches (<= %ld members each)",
+                 n_records,
+                 n_batches,
+                 max_members);
+
+  auto prune_order = build_prune_order(res, leaves, n_rows);
+
+  leaves.members.resize(0, stream);
+  leaves.members.shrink_to_fit(stream);
+  sketches.resize(0, stream);
+  sketches.shrink_to_fit(stream);
+  row_begin.resize(0, stream);
+  row_begin.shrink_to_fit(stream);
+  acc.release_hashes(stream);
+
+  raft::resource::sync_stream(res);
+  const auto elapsed_seconds =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - build_start).count();
+  log_message("GPiPNN work before direct edge prune completed in ", elapsed_seconds, " seconds");
+
+  direct_edge_prune(
+    res,
+    acc,
+    params,
+    graph,
+    static_cast<int64_t>(prune_order.size()) == n_rows ? prune_order.data() : nullptr);
+}
+
+template <typename DataT>
 class gpipnn_main_manager {
 
 public:
@@ -778,6 +978,12 @@ public:
     raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
     raft::device_matrix_view<id_t, int64_t, raft::row_major> graph)
   {
+    const auto build_start = std::chrono::steady_clock::now();
+    auto stream = raft::resource::get_cuda_stream(res).get();
+    rmm::device_uvector<half> half_storage(0, stream);
+    rmm::device_uvector<float> norms(0, stream);
+    const half* scoring_data = nullptr;
+
     constexpr std::ptrdiff_t kNumWorkers = 5;
     constexpr std::ptrdiff_t kNumCPUBufferSlots = 5; // will be calculated
     constexpr std::ptrdiff_t kNumGPUBufferSlots = 3; // will be calculated
@@ -790,11 +996,27 @@ public:
     gpu_buffer device_buffer{kNumGPUBufferSlots, kGPUBufferSize, gpu_alloc_stream};
 
     compute_job_synchronizer job_synchronizer; // used in construction of jobs
-    cpu_work_queue cpu_work_queue;
-    gpu_work_queue gpu_work_queue;
+    cpu_work_queue cpu_work_queue; // Jobs are NOT executed in serial order (multiple cpu workers)
+    gpu_work_queue gpu_work_queue; // Jobs are exectuded in serial order (one gpu worker)
 
     gpipnn_host_manager host_manager{kNumWorkers, cpu_work_queue};
     gpipnn_dev_manager dev_manager{res, gpu_work_queue};
+
+    gpu_work_queue.push_job(std::make_unique<gpipnn_setup_gpu_job<DataT>>(
+      job_synchronizer,
+      params_,
+      dataset,
+      graph,
+      half_storage,
+      norms,
+      scoring_data));
+    job_synchronizer.synchronize();
+
+    const int64_t n_rows = dataset.extent(0);
+    const int64_t dim    = dataset.extent(1);
+    auto scoring_view =
+      raft::make_device_matrix_view<const half, int64_t, raft::row_major>(scoring_data, n_rows, dim);
+    auto norms_view = raft::make_device_vector_view<const float, int64_t>(norms.data(), n_rows);
 
     constexpr std::size_t kNumTestJobs = 10;
     for (std::size_t job = 0; job < kNumTestJobs; ++job) {
@@ -809,6 +1031,7 @@ public:
     }
 
     job_synchronizer.synchronize();
+    gpipnn_build_remainder(res, params_, scoring_view, norms_view, graph, build_start);
   }
 
 private:
@@ -832,168 +1055,8 @@ void build_graph(raft::resources const& res,
                  raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
                  raft::device_matrix_view<id_t, int64_t, raft::row_major> graph)
 {
-  static_assert(std::is_same_v<DataT, float> || std::is_same_v<DataT, half> ||
-                  std::is_same_v<DataT, int8_t> || std::is_same_v<DataT, uint8_t>,
-                "gpipnn: only float, half, int8 and uint8 datasets are supported");
-
-  const auto arch_problem = gpipnn_arch_problem();
-  RAFT_EXPECTS(arch_problem.empty(), "%s", arch_problem.c_str());
-
-  const int64_t n_rows = dataset.extent(0);
-  const int64_t dim    = dataset.extent(1);
-  check_params(params, n_rows, dim, graph);
-
   gpipnn_main_manager<DataT> manager{params};
   manager.build(res, dataset, graph);
-
-  auto stream = raft::resource::get_cuda_stream(res).get();
-
-  // All scoring runs on half operands with fp32 accumulation and every other type is converted
-  // here. A dataset whose magnitudes do not fit half is rescaled by one shared power of two
-  // first, which preserves the neighbour ordering; see `half_cast_scale`.
-  //
-  // Cosine is also handled entirely here by scaling each row to unit norm as it is converted (see
-  // `normalize_rows_to_half_kernel`), which bounds every element by 1 and needs no rescaling.
-  const bool normalize = params.metric == cuvs::distance::DistanceType::CosineExpanded;
-  rmm::device_uvector<half> half_storage(0, stream);
-  const half* scoring_data = nullptr;
-  if constexpr (std::is_same_v<DataT, half>) {
-    if (!normalize) { scoring_data = dataset.data_handle(); }
-  }
-  if (scoring_data == nullptr) {
-    half_storage.resize(n_rows * dim, stream);
-    // Non-empty only on the float path below, and only when the peak was asserted rather than
-    // measured, which is the one case where it can be wrong. A measured peak cannot overflow by
-    // construction, since `half_cast_scale` lands it just under the top of the range.
-    rmm::device_uvector<int> overflowed(0, stream);
-    if (normalize) {
-      raft::launch_kernel(res,
-                          n_rows,
-                          256,
-                          normalize_rows_to_half_kernel<DataT, 256>,
-                          dataset.data_handle(),
-                          half_storage.data(),
-                          n_rows,
-                          dim);
-    } else {
-      // Only float can fall outside the range half represents: int8 and uint8 are bounded by
-      // 255, and a half input is representable by definition.
-      float scale = 1.0f;
-      if constexpr (std::is_same_v<DataT, float>) {
-        float max_abs = params.dataset_max_abs;
-        if (max_abs > 0.0f) {
-          overflowed.resize(1, stream);
-          raft::matrix::fill(
-            res, raft::make_device_vector_view<int, int64_t>(overflowed.data(), 1), 0);
-        } else {
-          max_abs = finite_max_abs(res, dataset.data_handle(), n_rows * dim);
-        }
-        scale = half_cast_scale(max_abs);
-        if (scale != 1.0f) {
-          RAFT_LOG_DEBUG(
-            "gpipnn: dataset magnitudes peak at %g, outside the range half holds usefully; "
-            "scaling by %g before conversion, which leaves the neighbour ordering unchanged",
-            static_cast<double>(max_abs),
-            static_cast<double>(scale));
-        }
-      }
-      cast_to_half(res,
-                   dataset.data_handle(),
-                   half_storage.data(),
-                   n_rows * dim,
-                   scale,
-                   overflowed.is_empty() ? nullptr : overflowed.data());
-    }
-    // Reading the flag back is skipped under dry run, where `overflowed` aliases the shared probe
-    // buffer and holds nothing. It only decides whether to throw, never a size, so assuming no
-    // overflow leaves the measured footprint exactly what it would have been.
-    if (!overflowed.is_empty() && !raft::resource::get_dry_run_flag(res)) {
-      // Costs a sync, but only on the path that skipped the one `finite_max_abs` does, so
-      // asserting the peak still removes a pass over the dataset rather than trading for it.
-      int flag = 0;
-      raft::update_host(&flag, overflowed.data(), 1, stream);
-      raft::resource::sync_stream(res);
-      RAFT_EXPECTS(flag == 0,
-                   "gpipnn: dataset_max_abs (%g) is below the dataset's actual peak, so the "
-                   "conversion to half overflowed; every distance touching those elements would "
-                   "be NaN. Raise it, or leave it at 0 to have the build measure it",
-                   static_cast<double>(params.dataset_max_abs));
-    }
-    scoring_data = half_storage.data();
-  }
-  auto scoring_view =
-    raft::make_device_matrix_view<const half, int64_t, raft::row_major>(scoring_data, n_rows, dim);
-
-  rmm::device_uvector<float> norms(n_rows, stream);
-  row_norms(scoring_data, n_rows, dim, norms.data(), stream);
-  auto norms_view = raft::make_device_vector_view<const float, int64_t>(norms.data(), n_rows);
-
-  carve_stats stats;
-  auto leaves = ball_carve(res, scoring_view, norms_view, params, stats);
-  RAFT_LOG_DEBUG(
-    "gpipnn: %ld leaves over %ld memberships after %ld rounds (%ld chopped, %ld merged, %ld still "
-    "oversized)",
-    leaves.count(),
-    leaves.total(),
-    stats.rounds_run,
-    stats.chopped_runs,
-    stats.merged_runs,
-    stats.oversized_left);
-
-  // The paper picks top-2 while we use default of 4 which we found to be better empirically.
-  const auto leaf_degree = static_cast<int64_t>(params.leaf_degree);
-  const auto hash_bits   = static_cast<int32_t>(params.hash_bits);
-
-  auto sketches = compute_sketches(res, scoring_view, hash_bits, params.seed + 7);
-  auto sketches_view =
-    raft::make_device_vector_view<const float, int64_t>(sketches.data(), n_rows * hash_bits);
-  auto acc = make_accumulator(res, n_rows, params.max_candidates);
-  rmm::device_uvector<int64_t> row_begin(n_rows + 1, stream);
-
-  // Leaves are packed into ranges by member count, since that is what the record array is
-  // proportional to. A single leaf always forms a range on its own if it has to, so the loop
-  // makes progress whatever the budget.
-  const int64_t max_members = leaf_batch_max_members(params, n_rows, leaf_degree);
-
-  int64_t n_batches = 0;
-  int64_t n_records = 0;
-  for (int64_t lo = 0; lo < leaves.count();) {
-    int64_t hi      = lo;
-    int64_t members = 0;
-    while (hi < leaves.count() && (hi == lo || members + leaves.size_of(hi) <= max_members)) {
-      members += leaves.size_of(hi);
-      hi++;
-    }
-    auto records = leaf_pick_range(res, scoring_view, norms_view, leaves, leaf_degree, lo, hi);
-    n_records += records.n_valid;
-    hash_prune_merge(res, sketches_view, records, params, row_begin, acc);
-    lo = hi;
-    n_batches++;
-  }
-  RAFT_LOG_DEBUG("gpipnn: %ld candidate edge records over %ld leaf batches (<= %ld members each)",
-                 n_records,
-                 n_batches,
-                 max_members);
-
-  // The prune's row order is the last thing the partition is needed for. See `build_prune_order`
-  // for details.
-  auto prune_order = build_prune_order(res, leaves, n_rows);
-
-  // Nothing below reads the partition, the sketches, the owner bounds or the per-entry hashes.
-  leaves.members.resize(0, stream);
-  leaves.members.shrink_to_fit(stream);
-  sketches.resize(0, stream);
-  sketches.shrink_to_fit(stream);
-  row_begin.resize(0, stream);
-  row_begin.shrink_to_fit(stream);
-  acc.release_hashes(stream);
-
-  direct_edge_prune(
-    res,
-    acc,
-    params,
-    graph,
-    static_cast<int64_t>(prune_order.size()) == n_rows ? prune_order.data() : nullptr);
 }
 
 }  // namespace cuvs::neighbors::experimental::gpipnn::detail
