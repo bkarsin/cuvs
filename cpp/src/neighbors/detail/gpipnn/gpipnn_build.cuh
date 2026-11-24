@@ -13,10 +13,12 @@
 #include "segmented_topk.cuh"
 
 #include <algorithm>
+#include <cstddef>
 #include <cuvs/neighbors/gpipnn.hpp>
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/logger.hpp>
+#include <raft/core/resource/device_id.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resource/dry_run_flag.hpp>
 #include <raft/core/resources.hpp>
@@ -170,68 +172,95 @@ private:
 
 };
 
-class cpu_job {
+// must outlive the compute_jobs
+class compute_job_synchronizer {
+  friend class compute_job;
+
 public:
-  enum class ExitStatus { kSuccess, kFailure };
-
-  virtual ~cpu_job() = default;
-  [[nodiscard]] auto execute() noexcept -> ExitStatus
+  void synchronize()
   {
-    try {
-      return execute_impl();
-    } catch (const std::exception& error) {
-      std::cerr << "CPU job failed: " << error.what() << std::endl;
-    } catch (...) {
-      std::cerr << "CPU job failed with an unknown exception" << std::endl;
-    }
-    return ExitStatus::kFailure;
-  }
-
-protected:
-  cpu_job() = default;
-  [[nodiscard]] virtual auto execute_impl() -> ExitStatus = 0;
-};
-
-// cuda_event must remain valid until job execution completes
-class hash_prune_merge_job : public cpu_job {
-public:
-  hash_prune_merge_job(cudaEvent_t cuda_event, cpu_buffer::cpu_buffer_slot buffer_slot)
-    : cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
-  {
-  }
-
-  [[nodiscard]] auto execute_impl() -> ExitStatus override
-  {
-    RAFT_CUDA_TRY(cudaEventSynchronize(cuda_event_));
-    std::cout << "hash_prune_merge" << std::endl;
-    return ExitStatus::kSuccess;
+    std::unique_lock<std::mutex> lock(mutex_);
+    empty_.wait(lock, [this] { return num_outstanding_jobs_ == 0; });
   }
 
 private:
-  cudaEvent_t cuda_event_;
-  cpu_buffer::cpu_buffer_slot buffer_slot_;
+  void record_start()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++num_outstanding_jobs_;
+  }
+
+  void record_end()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      RAFT_EXPECTS(num_outstanding_jobs_ > 0, "Compute job synchronizer count underflow");
+      --num_outstanding_jobs_;
+      if (num_outstanding_jobs_ != 0) { return; }
+    }
+    empty_.notify_all();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable empty_;
+  std::size_t num_outstanding_jobs_{0};
+};
+
+class compute_job {
+public:
+  compute_job(const compute_job&) = delete;
+  auto operator=(const compute_job&) -> compute_job& = delete;
+  compute_job(compute_job&&) = delete;
+  auto operator=(compute_job&&) -> compute_job& = delete;
+
+  virtual ~compute_job() { synchronizer_.record_end(); }
+  void execute() noexcept
+  {
+    try {
+      execute_impl();
+    } catch (const std::exception& error) {
+      std::cerr << "CPU job failed: " << error.what() << std::endl;
+      std::terminate();
+    } catch (...) {
+      std::cerr << "CPU job failed with an unknown exception" << std::endl;
+      std::terminate();
+    }
+  }
+
+protected:
+  explicit compute_job(compute_job_synchronizer& synchronizer) : synchronizer_{synchronizer}
+  {
+    synchronizer_.record_start();
+  }
+  virtual void execute_impl() = 0;
+
+private:
+  compute_job_synchronizer& synchronizer_;
 };
 
 // queue must outlive all workers
-class cpu_work_queue {
+class work_queue {
 public:
-  [[nodiscard]] auto pop_job() -> std::unique_ptr<cpu_job>
+  [[nodiscard]] auto pop_job() -> std::unique_ptr<compute_job>
   {
     std::unique_lock<std::mutex> lock(work_queue_mtx_);
     work_queue_ready_.wait(lock, [this] { return closed_ || !work_queue_.empty(); });
-    if (work_queue_.empty()) { return nullptr; } // queue must be closed and all remaining jobs were processed already
+    if (work_queue_.empty()) {
+      // queue must be closed and all remaining jobs were processed already
+      return nullptr;
+    }
 
     auto job = std::move(work_queue_.front());
     work_queue_.pop();
     return job;
   }
 
-  void push_job(std::unique_ptr<cpu_job> job)
+  void push_job(std::unique_ptr<compute_job> job)
   {
-    RAFT_EXPECTS(job != nullptr, "Cannot push a null CPU job");
+    RAFT_EXPECTS(job != nullptr, "Cannot push a null job");
     {
       std::lock_guard<std::mutex> lock(work_queue_mtx_);
-      RAFT_EXPECTS(!closed_, "Cannot push a CPU job after the work queue is closed");
+      RAFT_EXPECTS(!closed_, "Cannot push a job after the work queue is closed");
       work_queue_.push(std::move(job));
     }
     work_queue_ready_.notify_one();
@@ -248,34 +277,34 @@ public:
   }
 
 private:
-  std::queue<std::unique_ptr<cpu_job>> work_queue_;
+  std::queue<std::unique_ptr<compute_job>> work_queue_;
   std::mutex work_queue_mtx_;
   std::condition_variable work_queue_ready_;
   bool closed_{false};
 };
 
 class gpipnn_host_manager {
-  template <typename DataT>
-  friend class gpipnn_main_manager;
-
 public:
-  enum class WorkerStatus { kSuccess, kFailure };
-
-  explicit gpipnn_host_manager(std::ptrdiff_t num_workers)
+  gpipnn_host_manager(std::ptrdiff_t num_workers, work_queue& cpu_work_queue)
     : num_workers_{validate_num_workers(num_workers)},
+      cpu_work_queue_{cpu_work_queue},
       workers_(num_workers_),
-      worker_contexts_(num_workers_),
-      exit_statuses_(num_workers_, WorkerStatus::kSuccess)
+      worker_contexts_(num_workers_)
   {
     for (std::size_t worker_id = 0; worker_id < num_workers_; ++worker_id) {
-      worker_contexts_[worker_id] = worker_context{.manager=this, .worker_id=worker_id};
+      worker_contexts_[worker_id] =
+        worker_context{.manager = this, .worker_id = worker_id};
     }
 
     const int result = pthread_create(&manager_thread_,
                                       nullptr,
                                       &gpipnn_host_manager::manager_start_routine,
                                       this);
-    RAFT_EXPECTS(result == 0, "pthread_create failed for gpipnn_host_manager thread with error %d", result);
+    if (result != 0) {
+      std::cerr << "pthread_create failed for gpipnn_host_manager thread with error " << result
+                << std::endl;
+      std::terminate();
+    }
   }
 
   gpipnn_host_manager(const gpipnn_host_manager&) = delete;
@@ -285,32 +314,45 @@ public:
 
   ~gpipnn_host_manager() noexcept
   {
-    try {
-      work_queue_.close();
+    cpu_work_queue_.close();
 
-      const int result = pthread_join(manager_thread_, nullptr);
-      if (result != 0) {
-        std::cerr << "Failed to join gpipnn_host_manager thread with error " << result << std::endl;
-      } else if (manager_status_ == WorkerStatus::kFailure) {
-        std::cerr << "One or more CPU workers failed before host manager destruction" << std::endl;
-      }
-    } catch (const std::exception& error) {
-      std::cerr << "Failed to join CPU workers during host manager destruction: " << error.what()
-                << std::endl;
-    } catch (...) {
-      std::cerr << "Failed to join CPU workers during host manager destruction" << std::endl;
+    const int result = pthread_join(manager_thread_, nullptr);
+    if (result != 0) {
+      std::cerr << "Failed to join gpipnn_host_manager thread with error " << result << std::endl;
+      std::terminate();
     }
   }
 
-  void push_job(std::unique_ptr<cpu_job> job)
+  void push_job(std::unique_ptr<compute_job> job)
   {
-    work_queue_.push_job(std::move(job));
+    cpu_work_queue_.push_job(std::move(job));
   }
 
 private:
   struct worker_context {
     gpipnn_host_manager* manager;
     std::size_t worker_id;
+  };
+
+  class cpu_worker {
+  public:
+    explicit cpu_worker(work_queue& cpu_work_queue) : cpu_work_queue_{cpu_work_queue} {}
+
+    void run_worker(const worker_context& context)
+    {
+      const auto worker_id = context.worker_id;
+      while (true) {
+        auto job = cpu_work_queue_.pop_job();
+        if (job == nullptr) {
+          std::cout << "CPU worker " << worker_id << " exiting after queue close" << std::endl;
+          return;
+        }
+        job->execute();
+      }
+    }
+
+  private:
+    work_queue& cpu_work_queue_;
   };
 
   static auto validate_num_workers(std::ptrdiff_t num_workers) -> std::size_t
@@ -327,85 +369,49 @@ private:
 
   void run_manager() noexcept
   {
-    std::size_t num_launched = 0;
-    for (; num_launched < num_workers_; ++num_launched) {
-      const int result = pthread_create(&workers_[num_launched],
+    for (std::size_t worker = 0; worker < num_workers_; ++worker) {
+      const int result = pthread_create(&workers_[worker],
                                         nullptr,
                                         &gpipnn_host_manager::worker_start_routine,
-                                        &worker_contexts_[num_launched]);
+                                        &worker_contexts_[worker]);
       if (result != 0) {
         std::cerr << "CPU worker creation failed with error " << result << std::endl;
-        manager_status_ = WorkerStatus::kFailure;
-        work_queue_.close();
-        break;
+        std::terminate();
       }
     }
-
-    int join_error = 0;
-    for (std::size_t worker = 0; worker < num_launched; ++worker) {
+    for (std::size_t worker = 0; worker < num_workers_; ++worker) {
       const int result = pthread_join(workers_[worker], nullptr);
-      if (join_error == 0 && result != 0) { join_error = result; }
+      if (result != 0) {
+        std::cerr << "CPU worker join failed with error " << result << std::endl;
+        std::terminate();
+      }
     }
     workers_.clear();
-
-    if (join_error != 0) {
-      std::cerr << "CPU worker join failed with error " << join_error << std::endl;
-      manager_status_ = WorkerStatus::kFailure;
-    }
-    if (std::ranges::any_of(exit_statuses_.begin(),
-                            exit_statuses_.begin() + num_launched,
-                            [](auto status) { return status == WorkerStatus::kFailure; })) {
-      manager_status_ = WorkerStatus::kFailure;
-    }
-    work_queue_.close();
   }
 
   static auto worker_start_routine(void* argument) noexcept -> void*
   {
     auto& context = *static_cast<worker_context*>(argument);
-    context.manager->run_worker(context.worker_id);
+    try {
+      cpu_worker worker{context.manager->cpu_work_queue_};
+      worker.run_worker(context);
+    } catch (const std::exception& error) {
+      std::cerr << "CPU worker " << context.worker_id
+                << " exiting after exception: " << error.what() << std::endl;
+      std::terminate();
+    } catch (...) {
+      std::cerr << "CPU worker " << context.worker_id << " exiting after unknown exception"
+                << std::endl;
+      std::terminate();
+    }
     return nullptr;
   }
 
-  void run_worker(std::size_t worker_id) noexcept
-  {
-    auto worker_status = WorkerStatus::kSuccess;
-    try {
-      while (true) {
-        auto job             = work_queue_.pop_job();
-        if (job == nullptr) {
-          std::cout << "CPU worker " << worker_id << " exiting after queue close" << std::endl;
-          break;
-        }
-        const auto job_status = job->execute();
-        if (job_status == cpu_job::ExitStatus::kSuccess) { continue; }
-
-        if (job_status == cpu_job::ExitStatus::kFailure) {
-          std::cerr << "CPU worker " << worker_id << " exiting with failure" << std::endl;
-          worker_status = WorkerStatus::kFailure;
-          break;
-        } else {
-          RAFT_FAIL("Unsupported CPU job exit status");
-        }
-      }
-    } catch (const std::exception& error) {
-      std::cerr << "CPU worker " << worker_id << " exiting after exception: " << error.what()
-                << std::endl;
-      worker_status = WorkerStatus::kFailure;
-    } catch (...) {
-      std::cerr << "CPU worker " << worker_id << " exiting after unknown exception" << std::endl;
-      worker_status = WorkerStatus::kFailure;
-    }
-    exit_statuses_[worker_id] = worker_status;
-  }
-
   const std::size_t num_workers_;
-  cpu_work_queue work_queue_;
+  work_queue& cpu_work_queue_;
   pthread_t manager_thread_{};
   std::vector<pthread_t> workers_;
   std::vector<worker_context> worker_contexts_;
-  std::vector<WorkerStatus> exit_statuses_;
-  WorkerStatus manager_status_{WorkerStatus::kSuccess};
 };
 
 // device memory buffer for single GPU worker (max pipelined cuda streams is effectively number of slots)
@@ -477,22 +483,187 @@ private:
 };
 
 class gpipnn_dev_manager {
-  template <typename DataT>
-  friend class gpipnn_main_manager;
+public:
+  gpipnn_dev_manager(raft::resources const& res, work_queue& gpu_work_queue)
+    : worker_context_{
+        .res              = res,
+        .gpu_work_queue   = gpu_work_queue}
+  {
+    const int result =
+      pthread_create(
+        &gpu_worker_, nullptr, &gpipnn_dev_manager::worker_start_routine, &worker_context_);
+    if (result != 0) {
+      std::cerr << "pthread_create failed for gpipnn_dev_manager with error " << result
+                << std::endl;
+      std::terminate();
+    }
+  }
 
+  gpipnn_dev_manager(const gpipnn_dev_manager&) = delete;
+  auto operator=(const gpipnn_dev_manager&) -> gpipnn_dev_manager& = delete;
+  gpipnn_dev_manager(gpipnn_dev_manager&&) = delete;
+  auto operator=(gpipnn_dev_manager&&) -> gpipnn_dev_manager& = delete;
+
+  ~gpipnn_dev_manager() noexcept
+  {
+    worker_context_.gpu_work_queue.close();
+
+    const int result = pthread_join(gpu_worker_, nullptr);
+    if (result != 0) {
+      std::cerr << "Failed to join gpipnn_dev_manager thread with error " << result << std::endl;
+      std::terminate();
+    }
+  }
+
+private:
+  struct worker_context {
+    raft::resources const& res;
+    work_queue& gpu_work_queue;
+  };
+
+  class gpu_worker {
+  public:
+    explicit gpu_worker(raft::resources const& res)
+    {
+      try {
+        RAFT_CUDA_TRY(cudaSetDevice(raft::resource::get_device_id(res)));
+        RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&h2d_stream_handle_, cudaStreamNonBlocking));
+        RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&compute_stream_handle_, cudaStreamNonBlocking));
+        RAFT_CUDA_TRY(cudaStreamCreateWithFlags(&d2h_stream_handle_, cudaStreamNonBlocking));
+        h2d_stream_     = cuda::stream_ref{h2d_stream_handle_};
+        compute_stream_ = cuda::stream_ref{compute_stream_handle_};
+        d2h_stream_     = cuda::stream_ref{d2h_stream_handle_};
+      } catch (...) {
+        destroy_streams();
+        throw;
+      }
+    }
+
+    gpu_worker(const gpu_worker&) = delete;
+    auto operator=(const gpu_worker&) -> gpu_worker& = delete;
+    gpu_worker(gpu_worker&&) = delete;
+    auto operator=(gpu_worker&&) -> gpu_worker& = delete;
+
+    ~gpu_worker() noexcept { destroy_streams(); }
+
+    void run_worker(const worker_context& context)
+    {
+      while (true) {
+        auto job = context.gpu_work_queue.pop_job();
+        if (job == nullptr) {
+          std::cout << "GPU worker exiting after queue close" << std::endl;
+          return;
+        }
+        job->execute();
+      }
+    }
+
+  private:
+    void destroy_streams() noexcept
+    {
+      if (d2h_stream_handle_ != nullptr) {
+        RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(d2h_stream_handle_));
+        d2h_stream_handle_ = nullptr;
+      }
+      if (compute_stream_handle_ != nullptr) {
+        RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(compute_stream_handle_));
+        compute_stream_handle_ = nullptr;
+      }
+      if (h2d_stream_handle_ != nullptr) {
+        RAFT_CUDA_TRY_NO_THROW(cudaStreamDestroy(h2d_stream_handle_));
+        h2d_stream_handle_ = nullptr;
+      }
+      h2d_stream_     = cuda::stream_ref{cudaStream_t{nullptr}};
+      compute_stream_ = cuda::stream_ref{cudaStream_t{nullptr}};
+      d2h_stream_     = cuda::stream_ref{cudaStream_t{nullptr}};
+    }
+
+    cudaStream_t h2d_stream_handle_{nullptr};
+    cudaStream_t compute_stream_handle_{nullptr};
+    cudaStream_t d2h_stream_handle_{nullptr};
+    cuda::stream_ref h2d_stream_{cudaStream_t{nullptr}};
+    cuda::stream_ref compute_stream_{cudaStream_t{nullptr}};
+    cuda::stream_ref d2h_stream_{cudaStream_t{nullptr}};
+  };
+
+  static auto worker_start_routine(void* argument) noexcept -> void*
+  {
+    auto& context = *static_cast<worker_context*>(argument);
+    try {
+      gpu_worker worker{context.res};
+      worker.run_worker(context);
+    } catch (const std::exception& error) {
+      std::cerr << "GPU worker initialization failed: " << error.what() << std::endl;
+      std::terminate();
+    } catch (...) {
+      std::cerr << "GPU worker initialization failed with an unknown exception" << std::endl;
+      std::terminate();
+    }
+    return nullptr;
+  }
+
+  worker_context worker_context_;
+  pthread_t gpu_worker_{};
 };
+
+// cuda_event must remain valid until job execution completes
+class hash_prune_merge_cpu_job : public compute_job {
+  public:
+    hash_prune_merge_cpu_job(cudaEvent_t cuda_event,
+                             cpu_buffer::cpu_buffer_slot buffer_slot,
+                             compute_job_synchronizer& synchronizer)
+      : compute_job{synchronizer}, cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
+    {
+    }
+  
+    void execute_impl() override
+    {
+      RAFT_CUDA_TRY(cudaEventSynchronize(cuda_event_));
+      std::cout << "hash_prune_merge" << std::endl;
+    }
+  
+  private:
+    cudaEvent_t cuda_event_;
+    cpu_buffer::cpu_buffer_slot buffer_slot_;
+  };
 
 template <typename DataT>
 class gpipnn_main_manager {
 
 public:
-  void build(raft::resources const& res,
-    const index_params& params,
-    raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
-    raft::device_matrix_view<id_t, int64_t, raft::row_major> graph) {
-    
+
+  explicit gpipnn_main_manager(const index_params& params)
+    : params_(params)
+  {
   }
 
+  void build(raft::resources const& res,
+    raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
+    raft::device_matrix_view<id_t, int64_t, raft::row_major> graph)
+  {
+    constexpr std::ptrdiff_t kNumWorkers     = 1;
+    constexpr std::ptrdiff_t kNumBufferSlots = 3;
+    constexpr std::size_t kBufferSize        = std::size_t{1} << 20;
+
+    // define buffers first so they are destroyed last
+    cpu_buffer host_buffer{kNumBufferSlots, kBufferSize};
+    gpu_buffer device_buffer{
+      kNumBufferSlots, kBufferSize, raft::resource::get_cuda_stream(res)};
+
+    compute_job_synchronizer job_synchronizer; // used in construction of jobs
+    work_queue cpu_work_queue;
+    work_queue gpu_work_queue;
+
+    gpipnn_host_manager host_manager{kNumWorkers, cpu_work_queue};
+    gpipnn_dev_manager dev_manager{res, gpu_work_queue};
+
+    // ball carve till balls are small enough
+    job_synchronizer.synchronize();
+
+  }
+
+private:
+  const index_params& params_;
 };
 
 /**
