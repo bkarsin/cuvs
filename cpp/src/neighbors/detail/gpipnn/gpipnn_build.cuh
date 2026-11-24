@@ -12,6 +12,7 @@
 #include "partition.cuh"
 #include "segmented_topk.cuh"
 
+#include <algorithm>
 #include <cuvs/neighbors/gpipnn.hpp>
 
 #include <raft/core/device_mdspan.hpp>
@@ -27,8 +28,10 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <pthread.h>
+
 #include <algorithm>
-#include <cassert>
+#include <condition_variable>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -85,14 +88,6 @@ protected:
 
 // A buffer slot or call to get_slot outliving the cpu buffer is undefined behavior
 class cpu_buffer {
-  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
-  {
-    RAFT_EXPECTS(num_slots > 0, "cpu_buffer requires at least one slot");
-    RAFT_EXPECTS(num_slots <= std::counting_semaphore<>::max(),
-                  "cpu_buffer slot count exceeds the semaphore maximum");
-    return num_slots;
-  }
-
 public:
   class cpu_buffer_slot final : public buffer_slot {
     friend class cpu_buffer;
@@ -161,6 +156,14 @@ public:
   }
 
 private:
+  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
+  {
+    RAFT_EXPECTS(num_slots > 0, "cpu_buffer requires at least one slot");
+    RAFT_EXPECTS(num_slots <= std::counting_semaphore<>::max(),
+                  "cpu_buffer slot count exceeds the semaphore maximum");
+    return num_slots;
+  }
+
   std::vector<cpu_buffer_slot> available_slots_;
   std::counting_semaphore<> num_available_slots_; // threads wait till a slot is available
   std::mutex buffer_mtx_; // mutex to assign distinct slots to requesting threads
@@ -169,7 +172,7 @@ private:
 
 class cpu_job {
 public:
-  enum class ExitStatus { kSuccess, kFailure, kKill };
+  enum class ExitStatus { kSuccess, kFailure };
 
   virtual ~cpu_job() = default;
   [[nodiscard]] auto execute() noexcept -> ExitStatus
@@ -209,19 +212,15 @@ private:
   cpu_buffer::cpu_buffer_slot buffer_slot_;
 };
 
-class kill_job : public cpu_job {
-public:
-  [[nodiscard]] auto execute_impl() -> ExitStatus override { return ExitStatus::kKill; }
-};
-
-// must push one kill job per worker to kill all workers
 // queue must outlive all workers
 class cpu_work_queue {
 public:
   [[nodiscard]] auto pop_job() -> std::unique_ptr<cpu_job>
   {
-    work_queue_size_.acquire();
-    std::lock_guard<std::mutex> lock(work_queue_mtx_);
+    std::unique_lock<std::mutex> lock(work_queue_mtx_);
+    work_queue_ready_.wait(lock, [this] { return closed_ || !work_queue_.empty(); });
+    if (work_queue_.empty()) { return nullptr; } // queue must be closed and all remaining jobs were processed already
+
     auto job = std::move(work_queue_.front());
     work_queue_.pop();
     return job;
@@ -229,41 +228,188 @@ public:
 
   void push_job(std::unique_ptr<cpu_job> job)
   {
-    assert(job != nullptr);
-    std::lock_guard<std::mutex> lock(work_queue_mtx_);
-    work_queue_.push(std::move(job));
-    work_queue_size_.release();
+    RAFT_EXPECTS(job != nullptr, "Cannot push a null CPU job");
+    {
+      std::lock_guard<std::mutex> lock(work_queue_mtx_);
+      RAFT_EXPECTS(!closed_, "Cannot push a CPU job after the work queue is closed");
+      work_queue_.push(std::move(job));
+    }
+    work_queue_ready_.notify_one();
+  }
+
+  void close()
+  {
+    {
+      std::lock_guard<std::mutex> lock(work_queue_mtx_);
+      if (closed_) { return; }
+      closed_ = true;
+    }
+    work_queue_ready_.notify_all();
   }
 
 private:
   std::queue<std::unique_ptr<cpu_job>> work_queue_;
-  std::counting_semaphore<> work_queue_size_{0};
   std::mutex work_queue_mtx_;
+  std::condition_variable work_queue_ready_;
+  bool closed_{false};
 };
 
 class gpipnn_host_manager {
   template <typename DataT>
   friend class gpipnn_main_manager;
 
-private:
-
-
 public:
-  // Constructs empty hash buckets for hash pruning
-  explicit gpipnn_host_manager(...) {
-    
+  enum class WorkerStatus { kSuccess, kFailure };
+
+  explicit gpipnn_host_manager(std::ptrdiff_t num_workers)
+    : num_workers_{validate_num_workers(num_workers)},
+      workers_(num_workers_),
+      worker_contexts_(num_workers_),
+      exit_statuses_(num_workers_, WorkerStatus::kSuccess)
+  {
+    for (std::size_t worker_id = 0; worker_id < num_workers_; ++worker_id) {
+      worker_contexts_[worker_id] = worker_context{.manager=this, .worker_id=worker_id};
+    }
+
+    const int result = pthread_create(&manager_thread_,
+                                      nullptr,
+                                      &gpipnn_host_manager::manager_start_routine,
+                                      this);
+    RAFT_EXPECTS(result == 0, "pthread_create failed for gpipnn_host_manager thread with error %d", result);
   }
 
+  gpipnn_host_manager(const gpipnn_host_manager&) = delete;
+  auto operator=(const gpipnn_host_manager&) -> gpipnn_host_manager& = delete;
+  gpipnn_host_manager(gpipnn_host_manager&&) = delete;
+  auto operator=(gpipnn_host_manager&&) -> gpipnn_host_manager& = delete;
+
+  ~gpipnn_host_manager() noexcept
+  {
+    try {
+      work_queue_.close();
+
+      const int result = pthread_join(manager_thread_, nullptr);
+      if (result != 0) {
+        std::cerr << "Failed to join gpipnn_host_manager thread with error " << result << std::endl;
+      } else if (manager_status_ == WorkerStatus::kFailure) {
+        std::cerr << "One or more CPU workers failed before host manager destruction" << std::endl;
+      }
+    } catch (const std::exception& error) {
+      std::cerr << "Failed to join CPU workers during host manager destruction: " << error.what()
+                << std::endl;
+    } catch (...) {
+      std::cerr << "Failed to join CPU workers during host manager destruction" << std::endl;
+    }
+  }
+
+  void push_job(std::unique_ptr<cpu_job> job)
+  {
+    work_queue_.push_job(std::move(job));
+  }
+
+private:
+  struct worker_context {
+    gpipnn_host_manager* manager;
+    std::size_t worker_id;
+  };
+
+  static auto validate_num_workers(std::ptrdiff_t num_workers) -> std::size_t
+  {
+    RAFT_EXPECTS(num_workers > 0, "num_workers must be at least 1");
+    return static_cast<std::size_t>(num_workers);
+  }
+
+  static auto manager_start_routine(void* argument) noexcept -> void*
+  {
+    static_cast<gpipnn_host_manager*>(argument)->run_manager();
+    return nullptr;
+  }
+
+  void run_manager() noexcept
+  {
+    std::size_t num_launched = 0;
+    for (; num_launched < num_workers_; ++num_launched) {
+      const int result = pthread_create(&workers_[num_launched],
+                                        nullptr,
+                                        &gpipnn_host_manager::worker_start_routine,
+                                        &worker_contexts_[num_launched]);
+      if (result != 0) {
+        std::cerr << "CPU worker creation failed with error " << result << std::endl;
+        manager_status_ = WorkerStatus::kFailure;
+        work_queue_.close();
+        break;
+      }
+    }
+
+    int join_error = 0;
+    for (std::size_t worker = 0; worker < num_launched; ++worker) {
+      const int result = pthread_join(workers_[worker], nullptr);
+      if (join_error == 0 && result != 0) { join_error = result; }
+    }
+    workers_.clear();
+
+    if (join_error != 0) {
+      std::cerr << "CPU worker join failed with error " << join_error << std::endl;
+      manager_status_ = WorkerStatus::kFailure;
+    }
+    if (std::ranges::any_of(exit_statuses_.begin(),
+                            exit_statuses_.begin() + num_launched,
+                            [](auto status) { return status == WorkerStatus::kFailure; })) {
+      manager_status_ = WorkerStatus::kFailure;
+    }
+    work_queue_.close();
+  }
+
+  static auto worker_start_routine(void* argument) noexcept -> void*
+  {
+    auto& context = *static_cast<worker_context*>(argument);
+    context.manager->run_worker(context.worker_id);
+    return nullptr;
+  }
+
+  void run_worker(std::size_t worker_id) noexcept
+  {
+    auto worker_status = WorkerStatus::kSuccess;
+    try {
+      while (true) {
+        auto job             = work_queue_.pop_job();
+        if (job == nullptr) {
+          std::cout << "CPU worker " << worker_id << " exiting after queue close" << std::endl;
+          break;
+        }
+        const auto job_status = job->execute();
+        if (job_status == cpu_job::ExitStatus::kSuccess) { continue; }
+
+        if (job_status == cpu_job::ExitStatus::kFailure) {
+          std::cerr << "CPU worker " << worker_id << " exiting with failure" << std::endl;
+          worker_status = WorkerStatus::kFailure;
+          break;
+        } else {
+          RAFT_FAIL("Unsupported CPU job exit status");
+        }
+      }
+    } catch (const std::exception& error) {
+      std::cerr << "CPU worker " << worker_id << " exiting after exception: " << error.what()
+                << std::endl;
+      worker_status = WorkerStatus::kFailure;
+    } catch (...) {
+      std::cerr << "CPU worker " << worker_id << " exiting after unknown exception" << std::endl;
+      worker_status = WorkerStatus::kFailure;
+    }
+    exit_statuses_[worker_id] = worker_status;
+  }
+
+  const std::size_t num_workers_;
+  cpu_work_queue work_queue_;
+  pthread_t manager_thread_{};
+  std::vector<pthread_t> workers_;
+  std::vector<worker_context> worker_contexts_;
+  std::vector<WorkerStatus> exit_statuses_;
+  WorkerStatus manager_status_{WorkerStatus::kSuccess};
 };
 
 // device memory buffer for single GPU worker (max pipelined cuda streams is effectively number of slots)
 class gpu_buffer {
-  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
-  {
-    RAFT_EXPECTS(num_slots > 0, "gpu_buffer requires at least one slot");
-    return num_slots;
-  }
-
 public:
   class gpu_buffer_slot final : public buffer_slot {
     friend class gpu_buffer;
@@ -320,29 +466,25 @@ public:
   }
 
 private:
+  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
+  {
+    RAFT_EXPECTS(num_slots > 0, "gpu_buffer requires at least one slot");
+    return num_slots;
+  }
+
   std::vector<gpu_buffer_slot> slots_;
   std::size_t next_slot_{0};
 };
-
 
 class gpipnn_dev_manager {
   template <typename DataT>
   friend class gpipnn_main_manager;
 
-private:
-
-public:
-  explicit gpipnn_dev_manager(raft::resources const& res) {
-
-  }
-
 };
 
 template <typename DataT>
 class gpipnn_main_manager {
-  friend class gpipnn_host_manager;
-  friend class gpipnn_dev_manager;
-  
+
 public:
   void build(raft::resources const& res,
     const index_params& params,
