@@ -172,9 +172,10 @@ private:
 
 };
 
-// must outlive the compute_jobs
+// must outlive all jobs that reference it
 class compute_job_synchronizer {
-  friend class compute_job;
+  friend class cpu_job;
+  friend class gpu_job;
 
 public:
   void synchronize()
@@ -206,14 +207,14 @@ private:
   std::size_t num_outstanding_jobs_{0};
 };
 
-class compute_job {
+class cpu_job {
 public:
-  compute_job(const compute_job&) = delete;
-  auto operator=(const compute_job&) -> compute_job& = delete;
-  compute_job(compute_job&&) = delete;
-  auto operator=(compute_job&&) -> compute_job& = delete;
+  cpu_job(const cpu_job&) = delete;
+  auto operator=(const cpu_job&) -> cpu_job& = delete;
+  cpu_job(cpu_job&&) = delete;
+  auto operator=(cpu_job&&) -> cpu_job& = delete;
 
-  virtual ~compute_job() { synchronizer_.record_end(); }
+  virtual ~cpu_job() { synchronizer_.record_end(); }
   void execute() noexcept
   {
     try {
@@ -228,7 +229,7 @@ public:
   }
 
 protected:
-  explicit compute_job(compute_job_synchronizer& synchronizer) : synchronizer_{synchronizer}
+  explicit cpu_job(compute_job_synchronizer& synchronizer) : synchronizer_{synchronizer}
   {
     synchronizer_.record_start();
   }
@@ -238,10 +239,49 @@ private:
   compute_job_synchronizer& synchronizer_;
 };
 
+class gpu_job {
+public:
+  gpu_job(const gpu_job&) = delete;
+  auto operator=(const gpu_job&) -> gpu_job& = delete;
+  gpu_job(gpu_job&&) = delete;
+  auto operator=(gpu_job&&) -> gpu_job& = delete;
+
+  virtual ~gpu_job() { synchronizer_.record_end(); }
+  void execute(cuda::stream_ref h2d_copy_stream,
+               cuda::stream_ref compute_stream,
+               cuda::stream_ref d2h_copy_stream) noexcept
+  {
+    try {
+      execute_impl(h2d_copy_stream, compute_stream, d2h_copy_stream);
+    } catch (const std::exception& error) {
+      std::cerr << "GPU job failed: " << error.what() << std::endl;
+      std::terminate();
+    } catch (...) {
+      std::cerr << "GPU job failed with an unknown exception" << std::endl;
+      std::terminate();
+    }
+  }
+
+protected:
+  explicit gpu_job(compute_job_synchronizer& synchronizer)
+    : synchronizer_{synchronizer}
+  {
+    synchronizer_.record_start();
+  }
+
+  virtual void execute_impl(cuda::stream_ref h2d_copy_stream,
+                            cuda::stream_ref compute_stream,
+                            cuda::stream_ref d2h_copy_stream) = 0;
+
+private:
+  compute_job_synchronizer& synchronizer_;
+};
+
 // queue must outlive all workers
+template <typename JobT>
 class work_queue {
 public:
-  [[nodiscard]] auto pop_job() -> std::unique_ptr<compute_job>
+  [[nodiscard]] auto pop_job() -> std::unique_ptr<JobT>
   {
     std::unique_lock<std::mutex> lock(work_queue_mtx_);
     work_queue_ready_.wait(lock, [this] { return closed_ || !work_queue_.empty(); });
@@ -255,7 +295,7 @@ public:
     return job;
   }
 
-  void push_job(std::unique_ptr<compute_job> job)
+  void push_job(std::unique_ptr<JobT> job)
   {
     RAFT_EXPECTS(job != nullptr, "Cannot push a null job");
     {
@@ -277,15 +317,18 @@ public:
   }
 
 private:
-  std::queue<std::unique_ptr<compute_job>> work_queue_;
+  std::queue<std::unique_ptr<JobT>> work_queue_;
   std::mutex work_queue_mtx_;
   std::condition_variable work_queue_ready_;
   bool closed_{false};
 };
 
+using cpu_work_queue = work_queue<cpu_job>;
+using gpu_work_queue = work_queue<gpu_job>;
+
 class gpipnn_host_manager {
 public:
-  gpipnn_host_manager(std::ptrdiff_t num_workers, work_queue& cpu_work_queue)
+  gpipnn_host_manager(std::ptrdiff_t num_workers, cpu_work_queue& cpu_work_queue)
     : num_workers_{validate_num_workers(num_workers)},
       cpu_work_queue_{cpu_work_queue},
       workers_(num_workers_),
@@ -323,7 +366,7 @@ public:
     }
   }
 
-  void push_job(std::unique_ptr<compute_job> job)
+  void push_job(std::unique_ptr<cpu_job> job)
   {
     cpu_work_queue_.push_job(std::move(job));
   }
@@ -336,7 +379,7 @@ private:
 
   class cpu_worker {
   public:
-    explicit cpu_worker(work_queue& cpu_work_queue) : cpu_work_queue_{cpu_work_queue} {}
+    explicit cpu_worker(cpu_work_queue& cpu_work_queue) : cpu_work_queue_{cpu_work_queue} {}
 
     void run_worker(const worker_context& context)
     {
@@ -352,7 +395,7 @@ private:
     }
 
   private:
-    work_queue& cpu_work_queue_;
+    cpu_work_queue& cpu_work_queue_;
   };
 
   static auto validate_num_workers(std::ptrdiff_t num_workers) -> std::size_t
@@ -408,7 +451,7 @@ private:
   }
 
   const std::size_t num_workers_;
-  work_queue& cpu_work_queue_;
+  cpu_work_queue& cpu_work_queue_;
   pthread_t manager_thread_{};
   std::vector<pthread_t> workers_;
   std::vector<worker_context> worker_contexts_;
@@ -484,7 +527,7 @@ private:
 
 class gpipnn_dev_manager {
 public:
-  gpipnn_dev_manager(raft::resources const& res, work_queue& gpu_work_queue)
+  gpipnn_dev_manager(raft::resources const& res, gpu_work_queue& gpu_work_queue)
     : worker_context_{
         .res              = res,
         .gpu_work_queue   = gpu_work_queue}
@@ -518,7 +561,7 @@ public:
 private:
   struct worker_context {
     raft::resources const& res;
-    work_queue& gpu_work_queue;
+    gpu_work_queue& gpu_work_queue;
   };
 
   class gpu_worker {
@@ -554,7 +597,7 @@ private:
           std::cout << "GPU worker exiting after queue close" << std::endl;
           return;
         }
-        job->execute();
+        job->execute(h2d_stream_, compute_stream_, d2h_stream_);
       }
     }
 
@@ -607,12 +650,12 @@ private:
 };
 
 // cuda_event must remain valid until job execution completes
-class hash_prune_merge_cpu_job : public compute_job {
+class hash_prune_merge_cpu_job : public cpu_job {
   public:
     hash_prune_merge_cpu_job(cudaEvent_t cuda_event,
                              cpu_buffer::cpu_buffer_slot buffer_slot,
                              compute_job_synchronizer& synchronizer)
-      : compute_job{synchronizer}, cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
+      : cpu_job{synchronizer}, cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
     {
     }
   
@@ -651,8 +694,8 @@ public:
       kNumBufferSlots, kBufferSize, raft::resource::get_cuda_stream(res)};
 
     compute_job_synchronizer job_synchronizer; // used in construction of jobs
-    work_queue cpu_work_queue;
-    work_queue gpu_work_queue;
+    cpu_work_queue cpu_work_queue;
+    gpu_work_queue gpu_work_queue;
 
     gpipnn_host_manager host_manager{kNumWorkers, cpu_work_queue};
     gpipnn_dev_manager dev_manager{res, gpu_work_queue};
