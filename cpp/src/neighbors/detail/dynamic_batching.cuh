@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../sample_filter.cuh"
+#include "cuda_event.hpp"
 
 #include <cuvs/neighbors/dynamic_batching.hpp>
 
@@ -38,6 +39,8 @@
 #endif
 
 namespace cuvs::neighbors::dynamic_batching::detail {
+
+using cuvs::neighbors::detail::cuda_event;
 
 /**
  * A helper to make the requester threads more cooperative when busy-spinning.
@@ -74,33 +77,6 @@ struct local_waiter {
  private:
   std::chrono::nanoseconds base_sleep_time_;
   int64_t iteration_;
-};
-
-class cuda_event {
- public:
-  cuda_event(cuda_event&&)            = default;
-  cuda_event& operator=(cuda_event&&) = default;
-  ~cuda_event()                       = default;
-  cuda_event(cuda_event const&)       = delete;  // Copying disallowed: one event one owner
-  cuda_event& operator=(cuda_event&)  = delete;
-
-  cuda_event()
-    : event_{[]() {
-               cudaEvent_t* e = new cudaEvent_t;
-               RAFT_CUDA_TRY(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
-               return e;
-             }(),
-             [](cudaEvent_t* e) {
-               RAFT_CUDA_TRY_NO_THROW(cudaEventDestroy(*e));
-               delete e;
-             }}
-  {
-  }
-
-  cudaEvent_t value() const { return *event_; }
-
- private:
-  std::unique_ptr<cudaEvent_t, std::function<void(cudaEvent_t*)>> event_;
 };
 
 template <typename MdSpanOrArray>

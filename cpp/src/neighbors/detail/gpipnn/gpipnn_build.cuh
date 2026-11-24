@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "../cuda_event.hpp"
 #include "common.cuh"
 #include "direct_edge_prune.cuh"
 #include "hash_prune.cuh"
@@ -46,6 +47,19 @@
 #include <vector>
 
 namespace cuvs::neighbors::experimental::gpipnn::detail {
+
+using cuvs::neighbors::detail::cuda_event;
+
+inline std::mutex log_mutex;
+
+template <typename... Args>
+void log_message(Args&&... args)
+{
+  std::lock_guard<std::mutex> lock(log_mutex);
+  std::cout << std::dec;
+  (std::cout << ... << std::forward<Args>(args));
+  std::cout << std::endl;
+}
 
 /**
  * Leaf members one range may carry so the candidate buffer stays inside its budget.
@@ -387,7 +401,7 @@ private:
       while (true) {
         auto job = cpu_work_queue_.pop_job();
         if (job == nullptr) {
-          std::cout << "CPU worker " << worker_id << " exiting after queue close" << std::endl;
+          log_message("CPU worker ", worker_id, " exiting after queue close");
           return;
         }
         job->execute();
@@ -466,63 +480,63 @@ public:
   public:
     gpu_buffer_slot(const gpu_buffer_slot&) = delete;
     auto operator=(const gpu_buffer_slot&) -> gpu_buffer_slot& = delete;
-    gpu_buffer_slot(gpu_buffer_slot&&) noexcept = default;
+    gpu_buffer_slot(gpu_buffer_slot&& other) noexcept
+      : data_{std::move(other.data_)}, event_{std::move(other.event_)}
+    {
+    }
     auto operator=(gpu_buffer_slot&&) noexcept -> gpu_buffer_slot& = delete;
+
+    ~gpu_buffer_slot() override = default;
 
     [[nodiscard]] auto data() noexcept -> void* override { return data_.data(); }
     [[nodiscard]] auto size() const noexcept -> std::size_t override { return data_.size(); }
-    [[nodiscard]] auto event() const noexcept -> cudaEvent_t { return event_; }
+
+    void event_record(cuda::stream_ref stream)
+    {
+      RAFT_CUDA_TRY(cudaEventRecord(event_.value(), stream.get()));
+    }
 
   private:
-    gpu_buffer_slot(std::size_t buffer_size, cuda::stream_ref stream)
-      : data_{buffer_size, stream}
+    gpu_buffer_slot(std::size_t buffer_size, cuda::stream_ref allocation_stream)
+      : data_{buffer_size, allocation_stream}
     {
+      RAFT_CUDA_TRY(cudaEventRecord(event_.value(), allocation_stream.get()));
     }
 
     rmm::device_buffer data_;
-    cudaEvent_t event_{nullptr};
+    cuda_event event_;
   };
 
   gpu_buffer(const std::ptrdiff_t num_slots,
              const std::size_t buffer_size,
-             cuda::stream_ref stream)
+             cuda::stream_ref allocation_stream)
   {
-    const auto validated_num_slots = validate_num_slots(num_slots);
-    slots_.reserve(static_cast<std::size_t>(validated_num_slots));
-    for (std::ptrdiff_t slot = 0; slot < validated_num_slots; ++slot) {
-      slots_.push_back(gpu_buffer_slot{buffer_size, stream});
+    RAFT_EXPECTS(num_slots > 0, "gpu_buffer requires at least one slot");
+    slots_.reserve(static_cast<std::size_t>(num_slots));
+    for (std::ptrdiff_t slot = 0; slot < num_slots; ++slot) {
+      slots_.push_back(gpu_buffer_slot{buffer_size, allocation_stream});
     }
   }
 
-  // TODO(sdickman): check if necessary synchronization step
   ~gpu_buffer()
   {
     for (const auto& slot : slots_) {
-      if (slot.event_ != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaEventSynchronize(slot.event_)); }
+      RAFT_CUDA_TRY_NO_THROW(cudaEventSynchronize(slot.event_.value()));
     }
   }
 
-  // event represents the point at which the slot can be released
-  [[nodiscard]] auto get_slot(cudaEvent_t event) -> gpu_buffer_slot&
+  [[nodiscard]] auto get_slot() -> gpu_buffer_slot&
   {
-    RAFT_EXPECTS(event != nullptr, "event dependency must not be nullptr");
-
-    auto& slot = slots_[next_slot_];
-    if (slot.event_ != nullptr) { RAFT_CUDA_TRY(cudaEventSynchronize(slot.event_)); }
-    slot.event_ = event;
-    next_slot_ = (next_slot_ + 1) % slots_.size();
+    auto& slot = slots_[curr_slot_];
+    RAFT_CUDA_TRY(
+      cudaEventSynchronize(slot.event_.value())); // synchronizes allocation on first call
+    curr_slot_ = (curr_slot_ + 1) % slots_.size();
     return slot;
   }
 
 private:
-  static auto validate_num_slots(std::ptrdiff_t num_slots) -> std::ptrdiff_t
-  {
-    RAFT_EXPECTS(num_slots > 0, "gpu_buffer requires at least one slot");
-    return num_slots;
-  }
-
   std::vector<gpu_buffer_slot> slots_;
-  std::size_t next_slot_{0};
+  std::size_t curr_slot_{0}; // The current slot that is staged for return in get_slot()
 };
 
 class gpipnn_dev_manager {
@@ -594,7 +608,7 @@ private:
       while (true) {
         auto job = context.gpu_work_queue.pop_job();
         if (job == nullptr) {
-          std::cout << "GPU worker exiting after queue close" << std::endl;
+          log_message("GPU worker exiting after queue close");
           return;
         }
         job->execute(h2d_stream_, compute_stream_, d2h_stream_);
@@ -649,26 +663,106 @@ private:
   pthread_t gpu_worker_{};
 };
 
-// cuda_event must remain valid until job execution completes
 class hash_prune_merge_cpu_job : public cpu_job {
   public:
-    hash_prune_merge_cpu_job(cudaEvent_t cuda_event,
+    hash_prune_merge_cpu_job(cuda_event event,
                              cpu_buffer::cpu_buffer_slot buffer_slot,
                              compute_job_synchronizer& synchronizer)
-      : cpu_job{synchronizer}, cuda_event_{cuda_event}, buffer_slot_{std::move(buffer_slot)}
+      : cpu_job{synchronizer},
+        event_{std::move(event)},
+        buffer_slot_{std::move(buffer_slot)}
     {
     }
   
     void execute_impl() override
     {
-      RAFT_CUDA_TRY(cudaEventSynchronize(cuda_event_));
-      std::cout << "hash_prune_merge" << std::endl;
+      RAFT_CUDA_TRY(cudaEventSynchronize(event_.value()));
+      log_message("hash_prune_merge");
     }
   
   private:
-    cudaEvent_t cuda_event_;
+    cuda_event event_;
     cpu_buffer::cpu_buffer_slot buffer_slot_;
   };
+
+class test_cpu_job final : public cpu_job {
+public:
+  test_cpu_job(compute_job_synchronizer& synchronizer,
+               std::size_t job_id,
+               std::size_t dependency_id,
+               cpu_buffer::cpu_buffer_slot buffer_slot,
+               cuda_event dependency_event)
+    : cpu_job{synchronizer},
+      job_id_{job_id},
+      dependency_id_{dependency_id},
+      buffer_slot_{std::move(buffer_slot)},
+      dependency_event_{std::move(dependency_event)}
+  {
+  }
+
+private:
+  void execute_impl() override
+  {
+    RAFT_CUDA_TRY(cudaEventSynchronize(dependency_event_.value()));
+    log_message("Executing test CPU job ",
+                job_id_,
+                " after dependency ",
+                dependency_id_,
+                " with buffer ",
+                buffer_slot_.data());
+  }
+
+  std::size_t job_id_;
+  std::size_t dependency_id_;
+  cpu_buffer::cpu_buffer_slot buffer_slot_;
+  cuda_event dependency_event_;
+};
+
+class test_gpu_job final : public gpu_job {
+public:
+  test_gpu_job(compute_job_synchronizer& synchronizer,
+               std::size_t job_id,
+               gpu_buffer::gpu_buffer_slot& gpu_buffer_slot,
+               cpu_buffer::cpu_buffer_slot cpu_buffer_slot,
+               cpu_work_queue& cpu_work_queue)
+    : gpu_job{synchronizer},
+      synchronizer_{synchronizer},
+      job_id_{job_id},
+      gpu_buffer_slot_{gpu_buffer_slot},
+      cpu_buffer_slot_{std::move(cpu_buffer_slot)},
+      cpu_work_queue_{cpu_work_queue}
+  {
+  }
+
+private:
+  void execute_impl(cuda::stream_ref h2d_copy_stream,
+                    cuda::stream_ref compute_stream,
+                    cuda::stream_ref d2h_copy_stream) override
+  {
+    log_message("Executing test GPU job ",
+                job_id_,
+                " with GPU buffer ",
+                gpu_buffer_slot_.data(),
+                " and CPU buffer ",
+                cpu_buffer_slot_.data());
+    cuda_event completion_event;
+    RAFT_CUDA_TRY(cudaEventRecord(completion_event.value(), d2h_copy_stream.get()));
+    gpu_buffer_slot_.event_record(d2h_copy_stream);
+    auto cpu_job = std::make_unique<test_cpu_job>(
+      synchronizer_,
+      job_id_ + 1,
+      job_id_,
+      std::move(cpu_buffer_slot_),
+      std::move(completion_event));
+    cpu_work_queue_.push_job(std::move(cpu_job));
+  }
+
+  compute_job_synchronizer& synchronizer_;
+  std::size_t job_id_;
+  gpu_buffer::gpu_buffer_slot& gpu_buffer_slot_;
+  cpu_buffer::cpu_buffer_slot cpu_buffer_slot_;
+  cpu_work_queue& cpu_work_queue_;
+};
 
 template <typename DataT>
 class gpipnn_main_manager {
@@ -684,14 +778,16 @@ public:
     raft::device_matrix_view<const DataT, int64_t, raft::row_major> dataset,
     raft::device_matrix_view<id_t, int64_t, raft::row_major> graph)
   {
-    constexpr std::ptrdiff_t kNumWorkers     = 1;
-    constexpr std::ptrdiff_t kNumBufferSlots = 3;
-    constexpr std::size_t kBufferSize        = std::size_t{1} << 20;
+    constexpr std::ptrdiff_t kNumWorkers = 5;
+    constexpr std::ptrdiff_t kNumCPUBufferSlots = 5; // will be calculated
+    constexpr std::ptrdiff_t kNumGPUBufferSlots = 3; // will be calculated
+    constexpr std::size_t kCPUBufferSize = std::size_t{1} << 20; // will be calculate
+    constexpr std::size_t kGPUBufferSize = std::size_t{1} << 10; // will be calculate
 
     // define buffers first so they are destroyed last
-    cpu_buffer host_buffer{kNumBufferSlots, kBufferSize};
-    gpu_buffer device_buffer{
-      kNumBufferSlots, kBufferSize, raft::resource::get_cuda_stream(res)};
+    auto gpu_alloc_stream =raft::resource::get_cuda_stream(res);
+    cpu_buffer host_buffer{kNumCPUBufferSlots, kCPUBufferSize};
+    gpu_buffer device_buffer{kNumGPUBufferSlots, kGPUBufferSize, gpu_alloc_stream};
 
     compute_job_synchronizer job_synchronizer; // used in construction of jobs
     cpu_work_queue cpu_work_queue;
@@ -700,9 +796,19 @@ public:
     gpipnn_host_manager host_manager{kNumWorkers, cpu_work_queue};
     gpipnn_dev_manager dev_manager{res, gpu_work_queue};
 
-    // ball carve till balls are small enough
-    job_synchronizer.synchronize();
+    constexpr std::size_t kNumTestJobs = 10;
+    for (std::size_t job = 0; job < kNumTestJobs; ++job) {
+      const auto gpu_job_id = job * 2;
+      auto cpu_buffer_slot = host_buffer.get_slot();
+      auto& gpu_buffer_slot = device_buffer.get_slot();
+      gpu_work_queue.push_job(std::make_unique<test_gpu_job>(job_synchronizer,
+                                                            gpu_job_id,
+                                                            gpu_buffer_slot,
+                                                            std::move(cpu_buffer_slot),
+                                                            cpu_work_queue));
+    }
 
+    job_synchronizer.synchronize();
   }
 
 private:
@@ -736,6 +842,9 @@ void build_graph(raft::resources const& res,
   const int64_t n_rows = dataset.extent(0);
   const int64_t dim    = dataset.extent(1);
   check_params(params, n_rows, dim, graph);
+
+  gpipnn_main_manager<DataT> manager{params};
+  manager.build(res, dataset, graph);
 
   auto stream = raft::resource::get_cuda_stream(res).get();
 
