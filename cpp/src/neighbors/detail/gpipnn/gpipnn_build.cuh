@@ -34,6 +34,7 @@
 #include <pthread.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -42,6 +43,8 @@
 #include <mutex>
 #include <queue>
 #include <semaphore>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -51,12 +54,13 @@ namespace cuvs::neighbors::experimental::gpipnn::detail {
 using cuvs::neighbors::detail::cuda_event;
 
 inline std::mutex log_mutex;
+inline std::atomic<std::size_t> next_compute_job_id{0};
 
 template <typename... Args>
-void log_message(Args&&... args)
+void log_message(std::string_view prefix, Args&&... args)
 {
   std::lock_guard<std::mutex> lock(log_mutex);
-  std::cout << std::dec;
+  std::cout << std::dec << prefix;
   (std::cout << ... << std::forward<Args>(args));
   std::cout << std::endl;
 }
@@ -234,6 +238,8 @@ public:
 
   virtual ~compute_job() { synchronizer_.record_end(); }
 
+  [[nodiscard]] auto id() const noexcept -> std::size_t { return id_; }
+
   void execute(Args... args) noexcept
   {
     try {
@@ -249,7 +255,8 @@ public:
 
 protected:
   explicit compute_job(compute_job_synchronizer& synchronizer)
-    : synchronizer_{synchronizer}
+    : synchronizer_{synchronizer},
+      id_{next_compute_job_id.fetch_add(1, std::memory_order_relaxed)}
   {
     synchronizer_.record_start();
   }
@@ -258,23 +265,29 @@ protected:
 
 private:
   compute_job_synchronizer& synchronizer_;
+  const std::size_t id_;
 };
 
-class cpu_job : public compute_job<> {
+class cpu_job : public compute_job<std::string_view> {
 protected:
   explicit cpu_job(compute_job_synchronizer& synchronizer)
-    : compute_job<>{synchronizer}
+    : compute_job<std::string_view>{synchronizer}
   {
   }
 };
 
 // Every asynchronous GPU job must either synchronize itself or create a child job that waits on its completion event.
 class gpu_job
-  : public compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref> {
+  : public compute_job<raft::resources const&,
+                       cuda::stream_ref,
+                       cuda::stream_ref,
+                       std::string_view> {
 protected:
   explicit gpu_job(compute_job_synchronizer& synchronizer)
-    : compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref>{
-        synchronizer}
+    : compute_job<raft::resources const&,
+                  cuda::stream_ref,
+                  cuda::stream_ref,
+                  std::string_view>{synchronizer}
   {
   }
 };
@@ -386,13 +399,14 @@ private:
     void run_worker(const worker_context& context)
     {
       const auto worker_id = context.worker_id;
+      const auto log_prefix = "CPU Worker " + std::to_string(worker_id) + ": ";
       while (true) {
         auto job = cpu_work_queue_.pop_job();
         if (job == nullptr) {
-          log_message("CPU worker ", worker_id, " exiting after queue close");
+          log_message(log_prefix, "Exiting after queue close");
           return;
         }
-        job->execute();
+        job->execute(log_prefix);
       }
     }
 
@@ -590,13 +604,14 @@ private:
 
     void run_worker(const worker_context& context)
     {
+      constexpr std::string_view kLogPrefix = "GPU Worker: ";
       while (true) {
         auto job = context.gpu_work_queue.pop_job();
         if (job == nullptr) {
-          log_message("GPU worker exiting after queue close");
+          log_message(kLogPrefix, "Exiting after queue close");
           return;
         }
-        job->execute(context.res, h2d_stream_, d2h_stream_);
+        job->execute(context.res, h2d_stream_, d2h_stream_, kLogPrefix);
       }
     }
 
@@ -652,10 +667,10 @@ class hash_prune_merge_cpu_job : public cpu_job {
     {
     }
   
-    void execute_impl() override
+    void execute_impl(std::string_view log_prefix) override
     {
       RAFT_CUDA_TRY(cudaEventSynchronize(event_.value()));
-      log_message("hash_prune_merge");
+      log_message(log_prefix, "hash_prune_merge");
     }
   
   private:
@@ -679,10 +694,11 @@ public:
   }
 
 private:
-  void execute_impl() override
+  void execute_impl(std::string_view log_prefix) override
   {
     RAFT_CUDA_TRY(cudaEventSynchronize(dependency_event_.value()));
-    log_message("Executing test CPU job ",
+    log_message(log_prefix,
+                "Executing test CPU job ",
                 job_id_,
                 " after dependency ",
                 dependency_id_,
@@ -715,11 +731,13 @@ public:
 private:
   void execute_impl(raft::resources const& compute_res,
                     cuda::stream_ref h2d_copy_stream,
-                    cuda::stream_ref d2h_copy_stream) override
+                    cuda::stream_ref d2h_copy_stream,
+                    std::string_view log_prefix) override
   {
     auto cpu_buffer_slot = cpu_buffer_.get_slot();
     auto& gpu_buffer_slot = gpu_buffer_.get_slot();
-    log_message("Executing test GPU job ",
+    log_message(log_prefix,
+                "Executing test GPU job ",
                 job_id_,
                 " with GPU buffer ",
                 gpu_buffer_slot.data(),
@@ -854,7 +872,8 @@ public:
 private:
   void execute_impl(raft::resources const& compute_res,
                     cuda::stream_ref,
-                    cuda::stream_ref d2h_copy_stream) override
+                    cuda::stream_ref d2h_copy_stream,
+                    std::string_view) override
   {
     gpipnn_setup(compute_res,
                  params_,
@@ -941,7 +960,8 @@ void gpipnn_build_remainder(raft::resources const& res,
   raft::resource::sync_stream(res);
   const auto elapsed_seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - build_start).count();
-  log_message("GPiPNN work before direct edge prune completed in ", elapsed_seconds, " seconds");
+  log_message(
+    "", "GPiPNN work before direct edge prune completed in ", elapsed_seconds, " seconds");
 
   direct_edge_prune(
     res,
