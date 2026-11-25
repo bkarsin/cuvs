@@ -37,7 +37,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <exception>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -239,7 +238,6 @@ public:
   {
     try {
       execute_impl(std::forward<Args>(args)...);
-      if (callback_) { std::invoke(callback_, *this); }
     } catch (const std::exception& error) {
       std::cerr << "Compute job failed: " << error.what() << std::endl;
       std::terminate();
@@ -256,25 +254,17 @@ protected:
     synchronizer_.record_start();
   }
 
-  void set_callback(std::function<void(compute_job&)> callback)
-  {
-    callback_ = std::move(callback);
-  }
-
   virtual void execute_impl(Args... args) = 0;
 
 private:
   compute_job_synchronizer& synchronizer_;
-  std::function<void(compute_job&)> callback_{};
 };
 
 class cpu_job : public compute_job<> {
 protected:
-  explicit cpu_job(compute_job_synchronizer& synchronizer,
-          std::function<void(compute_job<>&)> callback = nullptr)
+  explicit cpu_job(compute_job_synchronizer& synchronizer)
     : compute_job<>{synchronizer}
   {
-    set_callback(std::move(callback));
   }
 };
 
@@ -282,14 +272,10 @@ protected:
 class gpu_job
   : public compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref> {
 protected:
-  explicit gpu_job(compute_job_synchronizer& synchronizer,
-          std::function<void(
-            compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref>&)> callback =
-            nullptr)
+  explicit gpu_job(compute_job_synchronizer& synchronizer)
     : compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref>{
         synchronizer}
   {
-    set_callback(std::move(callback));
   }
 };
 
@@ -715,26 +701,15 @@ public:
   test_gpu_job(compute_job_synchronizer& synchronizer,
                std::size_t job_id,
                gpu_buffer& gpu_buffer,
-               cpu_buffer::cpu_buffer_slot cpu_buffer_slot,
-               std::function<void(
-                 compute_job<raft::resources const&, cuda::stream_ref, cuda::stream_ref>&)> callback)
-    : gpu_job{synchronizer, std::move(callback)},
+               cpu_buffer& cpu_buffer,
+               cpu_work_queue& cpu_work_queue)
+    : gpu_job{synchronizer},
+      synchronizer_{synchronizer},
       job_id_{job_id},
       gpu_buffer_{gpu_buffer},
-      cpu_buffer_slot_{std::move(cpu_buffer_slot)}
+      cpu_buffer_{cpu_buffer},
+      cpu_work_queue_{cpu_work_queue}
   {
-  }
-
-  [[nodiscard]] auto job_id() const noexcept -> std::size_t { return job_id_; }
-
-  [[nodiscard]] auto release_cpu_slot() -> cpu_buffer::cpu_buffer_slot
-  {
-    return std::move(cpu_buffer_slot_);
-  }
-
-  [[nodiscard]] auto release_event() -> cuda_event
-  {
-    return std::move(dependency_event_);
   }
 
 private:
@@ -742,21 +717,29 @@ private:
                     cuda::stream_ref h2d_copy_stream,
                     cuda::stream_ref d2h_copy_stream) override
   {
+    auto cpu_buffer_slot = cpu_buffer_.get_slot();
     auto& gpu_buffer_slot = gpu_buffer_.get_slot();
     log_message("Executing test GPU job ",
                 job_id_,
                 " with GPU buffer ",
                 gpu_buffer_slot.data(),
                 " and CPU buffer ",
-                cpu_buffer_slot_.data());
-    RAFT_CUDA_TRY(cudaEventRecord(dependency_event_.value(), d2h_copy_stream.get()));
+                cpu_buffer_slot.data());
+    cuda_event completion_event;
+    RAFT_CUDA_TRY(cudaEventRecord(completion_event.value(), d2h_copy_stream.get()));
     gpu_buffer_slot.event_record(d2h_copy_stream);
+    cpu_work_queue_.push_job(std::make_unique<test_cpu_job>(synchronizer_,
+                                                           job_id_ + 1,
+                                                           job_id_,
+                                                           std::move(cpu_buffer_slot),
+                                                           std::move(completion_event)));
   }
 
+  compute_job_synchronizer& synchronizer_;
   std::size_t job_id_;
   gpu_buffer& gpu_buffer_;
-  cpu_buffer::cpu_buffer_slot cpu_buffer_slot_;
-  cuda_event dependency_event_;
+  cpu_buffer& cpu_buffer_;
+  cpu_work_queue& cpu_work_queue_;
 };
 
 template <typename DataT>
@@ -1036,23 +1019,12 @@ public:
     constexpr std::size_t kNumTestJobs = 10;
     for (std::size_t job = 0; job < kNumTestJobs; ++job) {
       const auto gpu_job_id = job * 2;
-      auto cpu_buffer_slot = host_buffer.get_slot();
-
-      auto callback_gpu_test_job = [&job_synchronizer, &cpu_work_queue](auto& job) {
-        auto& gpu_job_state = static_cast<test_gpu_job&>(job);
-        cpu_work_queue.push_job(std::make_unique<test_cpu_job>(
-          job_synchronizer,
-          gpu_job_state.job_id() + 1,
-          gpu_job_state.job_id(),
-          gpu_job_state.release_cpu_slot(),
-          gpu_job_state.release_event()));
-      };
 
       gpu_work_queue.push_job(std::make_unique<test_gpu_job>(job_synchronizer,
                                                             gpu_job_id,
                                                             device_buffer,
-                                                            std::move(cpu_buffer_slot),
-                                                            callback_gpu_test_job));
+                                                            host_buffer,
+                                                            cpu_work_queue));
     }
     job_synchronizer.synchronize();
 
